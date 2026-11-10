@@ -161,6 +161,7 @@ lark-cli auth status
 | `lark-workflow-meeting-summary` | 工作流：会议纪要汇总与结构化报告                          |
 | `lark-workflow-standup-report`  | 工作流：日程待办摘要                                |
 | `lark-okr`                      | 查询、创建、更新 OKR，管理目标、关键结果、对齐、指标和进展记录         |
+| `lark-daily-brief`              | 主动提醒：等我回的消息、逾期与临期待办、待我处理的审批、即将开始的日程 |
 
 ## 认证
 

@@ -160,6 +160,7 @@ lark-cli auth status
 | `lark-workflow-meeting-summary` | Workflow: meeting minutes aggregation & structured report                                                      |
 | `lark-workflow-standup-report`  | Workflow: agenda & todo summary                                                                                |
 | `lark-okr`                      | Query, create, update OKRs; manage objective & key results, alignments and indicators.                         |
+| `lark-daily-brief`              | Proactive daily brief: messages waiting on me, overdue/soon-due tasks, pending approvals, upcoming events.     |
 
 ## Authentication
 

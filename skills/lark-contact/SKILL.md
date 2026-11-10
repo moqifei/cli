@@ -5,6 +5,7 @@ description: "飞书 / Lark 通讯录:按姓名 / 邮箱解析成 open_id,或按
 metadata:
   requires:
     bins: ["lark-cli"]
+    scopes: ["contact:user:search", "contact:user.basic_profile:readonly"]
   cliHelp: "lark-cli contact --help"
 ---
 

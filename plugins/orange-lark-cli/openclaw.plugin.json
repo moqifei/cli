@@ -1,0 +1,18 @@
+{
+  "id": "orange-lark-cli",
+  "name": "Orange Lark CLI Channel",
+  "description": "Feishu/Lark channel for Orange backed by the official larksuite/cli binary",
+  "channels": ["feishu"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": true
+  },
+  "channelConfigs": {
+    "feishu": {
+      "schema": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    }
+  }
+}

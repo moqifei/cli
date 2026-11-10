@@ -1,0 +1,25 @@
+{
+  "name": "orange-lark-cli",
+  "version": "0.1.0",
+  "description": "Orange Feishu channel plugin backed by the official larksuite/cli",
+  "type": "module",
+  "main": "./dist/index.mjs",
+  "exports": {
+    ".": "./dist/index.mjs"
+  },
+  "openclaw": {
+    "extensions": ["./dist/index.mjs"],
+    "channel": {
+      "id": "orange-lark-cli",
+      "label": "Feishu (lark-cli)"
+    }
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "private": true
+}

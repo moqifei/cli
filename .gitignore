@@ -55,3 +55,13 @@ cover*.out
 
 lark-env.sh
 /automations/
+
+# ── plugins/orange-lark-cli (Orange 渠道插件) ────────────────────────────
+# 构建产物与从 ../skills 生成出来的技能副本都不入库
+plugins/orange-lark-cli/dist/
+plugins/orange-lark-cli/dist-pkg/
+plugins/orange-lark-cli/skills/
+plugins/orange-lark-cli/node_modules/
+# 上面的 /docs/ 规则会忽略插件自带实施方案文档，这里单独放行
+!plugins/orange-lark-cli/docs/
+!plugins/orange-lark-cli/docs/**
