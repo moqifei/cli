@@ -20,10 +20,84 @@ const fakeCli = path.join(here, "fake-lark-cli.mjs");
 
 // owner 隔离后授权门要求显式 resolver，否则所有发卡路径都会 fail-close，
 // device flow 根本起不来。测试里统一把调用方给的 account 钉上 owner。
-const { setOwnerAccountResolver } = await import("../src/auth-gate.mjs");
+const { setOwnerAccountResolver, classifyScopeGap, shouldInjectResume } = await import(
+  "../src/auth-gate.mjs"
+);
 setOwnerAccountResolver((ownerId, fallback) =>
   fallback ? { ...fallback, ownerUserId: ownerId } : null,
 );
+
+test("authorization completion keeps exactly one execution chain", () => {
+  // 13:53 的形状：cron 重跑已拉起，合成 resume 又带着「同意」另起一轮，
+  // 于是用户同时收到完整日报和一张「原始任务是什么」的确认卡片。
+  assert.equal(shouldInjectResume({ rerunJobs: 1, originTask: "同意" }), false);
+  assert.equal(shouldInjectResume({ rerunJobs: 1, originTask: "帮我做今天的飞书日报" }), false);
+
+  // 没有定时任务可重跑，但所谓「原始任务」只是确认词或为空：起一轮也只会反问。
+  for (const originTask of ["同意", "好的", "OK", "确认", "", "   "]) {
+    assert.equal(shouldInjectResume({ rerunJobs: 0, originTask }), false, `no resume for ${originTask}`);
+  }
+
+  // 纯入站对话里确实有真实任务描述时，才需要那条 resume。
+  assert.equal(shouldInjectResume({ rerunJobs: 0, originTask: "帮我做今天的飞书日报" }), true);
+  assert.equal(
+    shouldInjectResume({ rerunJobs: 0, originTask: "同意，顺便把昨天的会议纪要整理一下" }),
+    true,
+  );
+});
+
+test("declared mode separates undeclared scope gaps from real consent gaps", () => {
+  const declared = ["im:message:readonly", "search:message"];
+  const granted = new Set(declared);
+
+  // 11:09 的形状：drive +list-comments 需要 wiki scope，技能只声明了 im 相关。
+  // 这类缺口不能发卡，也不能吞掉本轮输出。
+  assert.equal(
+    classifyScopeGap({
+      mode: "declared",
+      missingScopes: ["wiki:node:read", "wiki:node:retrieve"],
+      granted,
+      declared,
+    }),
+    "undeclared_scope",
+  );
+  assert.equal(
+    classifyScopeGap({
+      mode: "declared",
+      missingScopes: ["wiki:node:read"],
+      granted: undefined,
+      declared,
+    }),
+    "undeclared_scope",
+  );
+
+  // 清单内且确实没授予：仍要走正常授权卡流程。
+  assert.equal(
+    classifyScopeGap({
+      mode: "declared",
+      missingScopes: ["im:message:readonly"],
+      granted: new Set(),
+      declared,
+    }),
+    "needs_consent",
+  );
+
+  // 已授予 / 无缺口 / 非 declared：交给原有逻辑，不干预。
+  assert.equal(
+    classifyScopeGap({
+      mode: "declared",
+      missingScopes: ["im:message:readonly"],
+      granted,
+      declared,
+    }),
+    null,
+  );
+  assert.equal(classifyScopeGap({ mode: "declared", missingScopes: [], granted, declared }), null);
+  assert.equal(
+    classifyScopeGap({ mode: "skill", missingScopes: ["wiki:node:read"], granted, declared }),
+    null,
+  );
+});
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -382,6 +456,7 @@ test("a verified token covering every scope stops the re-authorization loop", as
     "contact:user:search",
     "contact:user.basic_profile:readonly",
     "im:message:readonly",
+    "im:message.reactions:read",
     "search:message",
     "calendar:calendar.event:read",
     "task:task:read",
@@ -511,9 +586,34 @@ test("all-mode asks for the app's entire user-scope set in one card, then stops"
     assert.ok(requested.includes(scope), `the one-time grant must include ${scope}`);
   }
 
+  // 另一个授权门：argv=null、报的是另一条缺口。旧逻辑会把 gaps 并进清单，
+  // 两个门算出不同条数 → covers() 复用失败 → 用户收两张卡。
+  await ensureUserAuthorized({
+    account,
+    argv: null,
+    toolCtx: null,
+    chat,
+    log: makeLogger(),
+    force: true,
+    trigger: "scope",
+    missingScopes: ["a:three"],
+    toolName: "lark_cli",
+  });
+  await sleep(150);
+  const allFlows = readLog(sendLog).filter((entry) => entry.kind === "device_flow");
+  assert.equal(allFlows.length, 1, "两个授权门必须复用同一个 device flow，只发一张卡");
+  assert.equal(
+    String(allFlows[0].argv[allFlows[0].argv.indexOf("--scope") + 1] ?? ""),
+    requested,
+    "all 模式的清单不能随业务域或历史缺口变化",
+  );
+
   // device flow 完成后写好标记。
-  const markerFile = path.join(home, ".auth-grant-test.json");
-  await waitFor(() => fs.existsSync(markerFile));
+  // marker 按 accountId + ownerUserId 分文件（owner 隔离），不能写死文件名。
+  const markerFile = await waitFor(() => {
+    const name = fs.readdirSync(home).find((entry) => entry.startsWith(".auth-grant-"));
+    return name ? path.join(home, name) : null;
+  });
   const marker = JSON.parse(fs.readFileSync(markerFile, "utf8"));
   assert.equal(marker.count, 3);
   assert.match(marker.signature, /^all:/);
@@ -633,6 +733,7 @@ test("declared mode pins the minimal skill scopes for every auth gate", async ()
     [...fromHook].sort(),
     [
       "im:message:readonly",
+      "im:message.reactions:read",
       "search:message",
       "calendar:calendar.event:read",
       "task:task:read",

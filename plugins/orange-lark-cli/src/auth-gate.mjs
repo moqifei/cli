@@ -491,6 +491,15 @@ function hookResultText(kind) {
       "请直接按工具返回的原始错误说明这次操作为什么失败，然后结束本轮。"
     );
   }
+  if (kind === "undeclared_scope") {
+    return (
+      "UNDECLARED_SCOPE：这条命令需要的飞书权限不在本技能声明的最小授权清单内，" +
+      "用户点授权卡片也拿不到它，系统**不会**发授权卡片。这不是你或用户的操作错误。\n" +
+      "禁止：重试该命令、要求用户重新授权、等待授权、换工具反复试探、把授权列为待办、罗列 scope 名。\n" +
+      "请直接跳过这一个取数步骤（在简报里注明该段因权限跳过或直接省略），" +
+      "用已经取到的数据继续把整份日报写完并输出最终结果，不要结束本轮。"
+    );
+  }
   return (
     "AUTH_REQUIRED：本次调用缺少飞书用户授权。系统**已在本会话发出授权卡片**，" +
     "用户点完「去授权」后会自动继续，本轮到此结束。\n" +
@@ -499,6 +508,25 @@ function hookResultText(kind) {
     "唯一允许的输出是：" +
     AUTH_WAIT_LINE
   );
+}
+
+/**
+ * declared 模式下把「工具实报的权限缺口」分类：
+ *   - "undeclared_scope"：缺口全部落在技能声明清单之外。授权卡按清单申请，
+ *     永远拿不到这些 scope；发卡只会让用户白点一次，应让工具降级跳过。
+ *   - "needs_consent"   ：缺口里至少有一项在声明清单内，正常走授权卡流程。
+ *   - null              ：没有未授予的缺口，或不是 declared 模式。
+ *
+ * 纯函数，便于回归测试；钩子的 120ms 预算里也只能做这种同步判断。
+ */
+export function classifyScopeGap({ mode, missingScopes, granted, declared }) {
+  if (mode !== "declared") return null;
+  const unresolved = (missingScopes ?? []).filter((scope) => !granted?.has?.(scope));
+  if (!unresolved.length) return null;
+  const declaredSet = new Set(declared ?? []);
+  return unresolved.every((scope) => !declaredSet.has(scope))
+    ? "undeclared_scope"
+    : "needs_consent";
 }
 
 // ── 从哪里申请权限（技能声明 / 命令推断） ───────────────────────────────
@@ -607,7 +635,11 @@ export function authScopesFor(account, domains = null) {
   // declared 模式把清单钉死在技能声明上，忽略本次失败命令的业务域。
   // 否则工具预检门（带 argv）和 after_tool_call 钩子门（argv=null）会算出
   // 两份不同的清单，各自开一个 device flow —— 用户就会连收两张授权卡。
-  const want = new Set(authScopeMode(account) === "declared" ? [] : (domains ?? []));
+  // declared（技能最小集）和 all（应用全量）都把清单钉死，与本次失败命令的
+  // 业务域无关：带 argv 的工具预检门和 argv=null 的钩子门必须拿到同一份清单，
+  // 否则 startDeviceFlow.covers() 复用不了，用户会连收两张授权卡。
+  const mode = authScopeMode(account);
+  const want = new Set(mode === "declared" || mode === "all" ? [] : (domains ?? []));
   if (!want.size) {
     for (const scopes of map.values()) {
       for (const scope of scopes) union.add(scope);
@@ -974,11 +1006,31 @@ async function waitUntilJobIdle(port, jobId, { timeoutMs = 6 * 60_000 } = {}) {
   }
 }
 
+/** 只表示对授权征询的答复，不是一条任务描述。 */
+const CONSENT_ONLY_TASK =
+  /^(同意|好(的|吧)?|确认|确定|可以|ok|okay|yes|y|是|嗯|行|继续|授权|1|✅|👌)[\s。.!！,，、~]*$/i;
+
+/**
+ * 授权完成后还要不要注入一条合成入站消息去「继续刚才的任务」。
+ *
+ * 定时任务重跑自带完整的技能上下文，再起一条会话轮次就是两条链并行跑同一
+ * 件事；而「同意 / 好的」这类答复被当成原始任务时，模型无从知道要做什么，
+ * 只会反问「原始需求不在我当前的上下文中」并弹出确认卡片。两种情况都只
+ * 需要那一条状态通知，不要启动新的 agent run。
+ */
+export function shouldInjectResume({ rerunJobs = 0, originTask = "" } = {}) {
+  if (rerunJobs > 0) return false;
+  const origin = String(originTask ?? "").trim();
+  if (!origin || CONSENT_ONLY_TASK.test(origin)) return false;
+  return true;
+}
+
 /**
  * 授权完成后重跑触发它的主动任务。
  *
  * 否则定时轮因为「数据源未授权」产出 NO_UPDATES，调度器判定无增量不投递，
- * 用户授权完就再也听不到消息了。
+ * 用户授权完就再也听不到消息了。返回拉起的作业数，调用方据此决定是否还要
+ * 注入合成 resume（见 shouldInjectResume）。
  */
 function triggerProactiveRerun(log, ownerId) {
   // 只重跑**刚完成授权的那个人**的作业。旧实现把台账里所有 active job 一起
@@ -987,7 +1039,7 @@ function triggerProactiveRerun(log, ownerId) {
   const owner = normalizeOwnerId(ownerId);
   if (!owner) {
     log.warn("proactive rerun skipped: cannot attribute this authorization to a user");
-    return;
+    return 0;
   }
   let jobIds = [];
   try {
@@ -1008,7 +1060,7 @@ function triggerProactiveRerun(log, ownerId) {
       .map((routine) => routine.cron_job_id);
   } catch (error) {
     log.warn(`proactive rerun skipped: ${error?.message ?? error}`);
-    return;
+    return 0;
   }
   log.info(`proactive rerun: ${jobIds.length} job(s) owned by ${owner}`);
 
@@ -1037,6 +1089,7 @@ function triggerProactiveRerun(log, ownerId) {
       }
     })();
   }
+  return jobIds.length;
 }
 
 // ── 授权门主逻辑 ────────────────────────────────────────────────────────
@@ -1159,10 +1212,13 @@ export async function ensureUserAuthorized({
     !explicit?.length && mode === "skill"
       ? scopesForDomains(appScopes, domains, { keep: [...declared, ...gaps] })
       : [];
+  // all 模式把清单钉死在「应用已开通的全部用户级权限」上：不并技能声明，
+  // 更不并历史 gaps。否则每报一次 missing_scope，gaps 就多一项，两个门算出的
+  // 条数和签名都不同，covers() 复用失败 —— 一次授权变成两张卡。
   let wanted = explicit?.length
     ? [...explicit]
     : full?.size
-      ? [...new Set([...full, ...declared, ...gaps])]
+      ? [...full]
       : pinned
         ? [...new Set([...declared, ...ALWAYS_SCOPES])]
         : [...new Set([...domainScoped, ...declared, ...gaps])];
@@ -1172,12 +1228,16 @@ export async function ensureUserAuthorized({
   // 申请前先过滤：同意页上出现一行红色「无法授予」会让整套授权看起来是坏的。
   const scopes = await grantableScopes(account, wanted, { log });
   const batchMode = Boolean(full?.size) && !explicit?.length;
-  // 钉死清单后签名只看清单内容：工具预检门（有 argv）和钩子门（argv=null）
-  // 算出的 domains 天然不同，旧签名含 domains+count 会让两个门、以及重启后的
-  // marker 永远对不上，授权完成后又被判成「没点过」再弹一张卡。
-  const signature = pinned
-    ? `pinned:${[...scopes].sort().join(",")}`
-    : grantSignature(mode, mode === "all" ? [] : domains, scopes.length);
+  // 钉死清单（pinned）和全量清单（all）的签名都只看 scope 内容：工具预检门
+  // （有 argv）和钩子门（argv=null）算出的 domains 天然不同，旧签名含
+  // domains+count 会让两个门、以及重启后的 marker 永远对不上，授权完成后又
+  // 被判成「没点过」再弹一张卡。
+  const signature =
+    mode === "all"
+      ? `all:${[...scopes].sort().join(",")}`
+      : pinned
+        ? `pinned:${[...scopes].sort().join(",")}`
+        : grantSignature(mode, domains, scopes.length);
   log.info(
     `authorization scope request: mode=${mode} domains=${domains.join("+") || "-"} ` +
       `count=${scopes.length} gaps=${gaps.length} granted=${granted.size}`,
@@ -1187,6 +1247,23 @@ export async function ensureUserAuthorized({
   // 这里看的是「同模式 + 同域集合 + 同条数」的那次授权点过没有 —— 用 grantedScopes
   // 逐项比对会被租户策略挡掉的个别 scope 拖成无限弹卡。
   if (force && trigger === "scope" && status.userReady) {
+    // 工具实报的缺口全部落在声明清单之外时，用户授权卡永远拿不到这些 scope：
+    // 发一张卡既解决不了问题，还让用户多点一次。直接判「不是授权问题」，
+    // 由工具把原始错误抛回模型，钩子再注入降级提示。
+    const gapKind = classifyScopeGap({
+      mode,
+      missingScopes,
+      granted,
+      declared: authScopesFor(account),
+    });
+    if (gapKind === "undeclared_scope") {
+      log.warn(
+        `scope gap outside declared set (${(missingScopes ?? []).join(",")}); ` +
+          "no device flow: a user consent card cannot grant these scopes",
+      );
+      return { ok: true, already_authorized: true, reason: "undeclared_scope" };
+    }
+
     const marker = readGrantMarker(account);
     // 两个互补的「不用再授权」判据：
     //   1. token 已经覆盖钉死清单里的每一项 —— 用户此前授过更大的范围，
@@ -1195,12 +1272,16 @@ export async function ensureUserAuthorized({
     //      和重启后都能命中；个别 scope 被租户策略挡掉也不会拖成无限弹卡。
     // `offline_access` 这类 OAuth 前提权限不体现在 grantedScopes 里，逐项
     // 比对时要把它们排除，否则「已授过全量」的老用户会被判成还差一条。
+    // 工具明确报了仍未授予的 scope 时，绝不能靠 marker 短路成「已授权齐全」。
+    const unresolvedGap = (missingScopes ?? []).filter((scope) => !granted.has(scope));
     const pinnedCovered =
+      unresolvedGap.length === 0 &&
       pinned &&
       scopes.length > 0 &&
       scopes.filter((scope) => !ALWAYS_SCOPES.has(scope)).every((scope) => granted.has(scope));
     const alreadyGranted =
-      pinnedCovered || Boolean(marker?.signature === signature && scopes.length > 0);
+      (pinned ? unresolvedGap.length === 0 : true) &&
+      (pinnedCovered || Boolean(marker?.signature === signature && scopes.length > 0));
     if (alreadyGranted) {
       log.warn(
         `authorization grant already completed for ${signature}; ` +
@@ -1505,7 +1586,12 @@ function scheduleAuthorizationCompletion({ account, flow, chat, log }) {
     // 触发这次授权的 run 已经以 NO_UPDATES 收尾，不重跑就等于没有输出。
     // 现在按 owner 过滤，所以入站轮次也可以安全地补跑这个人自己的作业，
     // 不会再像旧实现那样把台账里所有人的 active job 一起拉起来。
-    triggerProactiveRerun(log, flow.ownerUserId ?? normalizeOwnerId(chat?.senderId));
+    const rerunJobs = triggerProactiveRerun(
+      log,
+      flow.ownerUserId ?? normalizeOwnerId(chat?.senderId),
+    );
+    const originTask = String(flow.originTask ?? "").trim();
+    const injectResume = shouldInjectResume({ rerunJobs, originTask });
 
     if (flow.cardId) {
       await updateCardEntity(account, flow.cardId, buildAuthCardV2({ state: "done" }), ++flow.cardSequence, {
@@ -1521,13 +1607,28 @@ function scheduleAuthorizationCompletion({ account, flow, chat, log }) {
       cwd: account.scratchDir,
       identity: account.identity,
       to,
-      text: "✅ 已完成飞书授权，正在继续刚才的操作…",
+      text: rerunJobs > 0
+        ? "✅ 已完成飞书授权，正在重新执行刚才的定时任务…"
+        : injectResume
+          ? "✅ 已完成飞书授权，正在继续刚才的操作…"
+          : "✅ 已完成飞书授权。当前会话里没有可继续的原始任务，需要我继续时再说一句需求即可。",
       timeoutMs: account.sendTimeoutMs,
       env: account.env,
       log,
     }).catch((error) => {
       log.warn(`failed to send auth confirmation: ${error?.message ?? error}`);
     });
+
+    // 有定时任务重跑、或原始任务只是「同意」这类确认词时，不要再起一条会话
+    // 轮次：那条链的上下文里没有任务描述，模型只会反问「原始需求不在上下文中」
+    // 并弹出确认卡片，与正在重跑的日报并行出现，就成了「日报 + 不知道要做什么」。
+    if (!injectResume) {
+      log.info(
+        `skipping synthetic resume after authorization ` +
+          `(rerunJobs=${rerunJobs}, originTask=${originTask ? `"${originTask.slice(0, 40)}"` : "missing"})`,
+      );
+      return;
+    }
 
     // runtime 是按**渠道账号**注册的，按人目录账号的 accountId 是 open_id，
     // 直接拿它去查会找不到。resume 也必须走渠道账号，否则入站路由认不出会话。
@@ -1538,18 +1639,16 @@ function scheduleAuthorizationCompletion({ account, flow, chat, log }) {
       log.warn("no runtime registered, cannot resume after authorization");
       return;
     }
-    // 要点名被打断的任务。只说「请继续刚才的操作」时模型会答「我找不到刚才的操作」。
-    const origin = String(flow.originTask ?? "").trim();
+    // 走到这里一定有可引用的真实任务（见 shouldInjectResume）。要点名被打断的
+    // 任务；只说「请继续刚才的操作」时模型会答「我找不到刚才的操作」。
     // 刻意不提被打断的那条命令：提到 `lark-cli calendar +agenda …` 会让模型把
     // 那一次调用当成整个任务，跑完一条命令就收工。
-    const resumeText = origin
-      ? `${origin}\n\n——以上是我上一条消息的原话。我已完成飞书账号授权，权限已齐全。` +
-        "请按上面的要求把整件事**从头完整重做一遍**并给出最终结果；" +
-        "如果这是一项由技能定义的任务（例如每日飞书简报），请重新加载该技能并从第一步做起；" +
-        "不要只重跑其中一条命令，也不要把一条命令的输出当成答案（那只是整件事里的一个取数步骤）。"
-      : "我已完成飞书账号授权，权限已齐全。\n" +
-        "请继续并**完整完成**你上一轮被打断的那个任务，产出最终结果；" +
-        "不要只重跑其中一条命令，也不要把一条命令的输出当成答案。";
+    const origin = originTask;
+    const resumeText =
+      `${origin}\n\n——以上是我上一条消息的原话。我已完成飞书账号授权，权限已齐全。` +
+      "请按上面的要求把整件事**从头完整重做一遍**并给出最终结果；" +
+      "如果这是一项由技能定义的任务（例如每日飞书简报），请重新加载该技能并从第一步做起；" +
+      "不要只重跑其中一条命令，也不要把一条命令的输出当成答案（那只是整件事里的一个取数步骤）。";
     log.info(`resume after authorization: originTask=${origin ? `"${origin.slice(0, 60)}"` : "missing"}`);
     void runtime
       .dispatchSyntheticUserMessage({
@@ -1676,6 +1775,26 @@ export function registerAuthHooks({ api, getAccounts, logger }) {
         const snapshot = verifiedAuth(account);
         const declared = authScopesFor(account);
         const explicitGap = failure.missingScopes ?? [];
+        // 缺口落在 declared 清单之外时，授权卡根本不会包含它：既不能发卡，
+        // 更不能 markTurnGated 把本轮已取到的数据一起吞掉。旧逻辑在这里先
+        // 告诉模型「已发卡请等待」，异步才判 already_authorized，模型于是
+        // 卡在等一张不存在的卡，整轮被拖到十几分钟且没有日报。
+        const gapKind = classifyScopeGap({
+          mode: authScopeMode(account),
+          missingScopes: explicitGap,
+          granted: snapshot?.granted,
+          declared,
+        });
+        if (gapKind === "undeclared_scope") {
+          log.warn(
+            `auth gate: scope gap outside declared set (${explicitGap.join(",")}) ` +
+              `for tool=${toolName}; not a consent problem — letting the turn finish`,
+          );
+          return {
+            action: "modify",
+            payload: { ...payload, is_error: false, result: hookResultText("undeclared_scope") },
+          };
+        }
         const alreadyCovered = Boolean(
           snapshot?.userReady &&
             (explicitGap.length
@@ -1726,7 +1845,7 @@ export function registerAuthHooks({ api, getAccounts, logger }) {
           .then(async (gate) => {
             if (gate?.awaiting_authorization) {
               log.info(`auth gate: authorization card sent for tool=${toolName}`);
-            } else if (gate?.already_authorized) {
+            } else if (gate?.already_authorized && gate.reason !== "undeclared_scope") {
               // 钩子已经把结果改写成「已发卡片」，这里补一句，免得用户去找一张
               // 根本不存在的授权卡。
               log.info("auth gate: no card sent, token already covers the requested scopes");
