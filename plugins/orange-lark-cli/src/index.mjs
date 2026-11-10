@@ -138,6 +138,7 @@ export function defaultCliPath() {
 export function accountsFromChannelConfig(api) {
   const accounts = api?.config?.channels?.feishu?.accounts;
   if (!accounts || typeof accounts !== "object" || Array.isArray(accounts)) return null;
+  const brand = asString(api?.config?.channels?.feishu?.domain, "feishu");
   const out = {};
   for (const [accountId, value] of Object.entries(accounts)) {
     if (!value || typeof value !== "object") continue;
@@ -145,9 +146,58 @@ export function accountsFromChannelConfig(api) {
     out[accountId] = {
       config_dir: path.join(orangeHome(), "data", "lark-cli", accountId),
       identity: "bot",
+      // 企业首装时把渠道里已经配好的应用凭据带下去，由 normalizeAccounts
+      // 落成 CLI 的 config.json。旧部署里已有 config.json 的不会被覆盖。
+      app_id: asString(value.appId ?? value.app_id, ""),
+      app_secret: asString(value.appSecret ?? value.app_secret, ""),
+      brand,
     };
   }
   return Object.keys(out).length > 0 ? out : null;
+}
+
+/**
+ * 企业首装兜底：`channels.feishu.accounts` 里已有 appId/appSecret 时，把它
+ * 落成 lark-cli 的 `config.json`。没有这一步，gateway 能起来、插件也能加载，
+ * 但每次 send 都报 `[config/not_configured] not configured`。
+ *
+ * secret 用 `file:` 引用而不是内联：CLI 默认把明文 secret 存系统 keychain，
+ * Kylin/CentOS 这类没有 keychain 的机器上会直接失败；`file:` 是 CLI 明确
+ * 支持的绕过方式（internal/core/secret_resolve.go）。
+ *
+ * 已有 config.json 时绝不覆盖 —— 那可能是用户 `config init` 出来的。
+ */
+function seedCliAppConfig(configDir, cfg, chan, log) {
+  const configPath = path.join(configDir, "config.json");
+  if (fs.existsSync(configPath)) return;
+  const appId = asString(cfg?.app_id ?? cfg?.appId, "");
+  const secret = asString(cfg?.app_secret ?? cfg?.appSecret, "");
+  // 未展开的 ${ENV} 引用写进 config.json 只会让 CLI 报错，宁可留空让用户
+  // 自己 config init，也不要把坏配置伪装成已配置。
+  if (!appId || !secret || /^\$\{.*\}$/.test(secret)) return;
+  try {
+    const secretPath = path.join(configDir, ".appsecret");
+    fs.writeFileSync(secretPath, secret, { mode: 0o600 });
+    fs.chmodSync(secretPath, 0o600);
+    const brand = asString(cfg?.brand ?? chan?.domain, "feishu") === "lark" ? "lark" : "feishu";
+    const config = {
+      apps: [
+        {
+          appId,
+          appSecret: { source: "file", id: secretPath },
+          brand,
+          users: [],
+        },
+      ],
+    };
+    fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+    fs.chmodSync(configPath, 0o600);
+    log?.info?.(
+      `seeded lark-cli config for ${appId} in ${configDir} (file-backed app secret, users empty)`,
+    );
+  } catch (error) {
+    log?.warn?.(`failed to seed lark-cli config in ${configDir}: ${error?.message ?? error}`);
+  }
 }
 
 /**
@@ -244,6 +294,15 @@ export function normalizeAccounts(
       const accountCfg = value;
       const configDir = ensureDir(
         asString(accountCfg.config_dir, path.join(orangeHome(), "data", "lark-cli", accountId)),
+      );
+      // 企业首装：CLI 目录里还没有 config.json 时，用 channels.feishu.accounts
+      // 的 appId/appSecret 生成一份（file: 存 secret），否则 send 一律
+      // `[config/not_configured]`。
+      seedCliAppConfig(
+        configDir,
+        { ...(chan?.accounts?.[accountId] ?? {}), ...accountCfg },
+        chan,
+        log,
       );
       // 账号级 `proxy:` 完全覆盖插件级（不是逐字段合并），避免「半套配置」更难排查。
       const proxy =

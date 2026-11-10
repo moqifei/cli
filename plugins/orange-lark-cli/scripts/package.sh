@@ -134,8 +134,53 @@ node "$ROOT/build.mjs"
 echo "==> targets: $TARGET_GOOS / $TARGET_LIST (CGO_ENABLED=$CGO_ENABLED, static ELF)"
 echo "    host   : $HOST_GOOS/$HOST_GOARCH"
 
+GO_TOOLCHAIN_CHECKED=0
+
+# 交叉编译 lark-cli 需要 Go >= 1.23.0（cli/go.mod 的 go 指令）。
+# 企业内网机器常常只报 "go: command not found"，这里给出可直接照做的版本提示。
+ensure_go_toolchain() {
+  [ "$GO_TOOLCHAIN_CHECKED" = "1" ] && return 0
+  if ! command -v go >/dev/null 2>&1; then
+    cat >&2 <<'EOF'
+error: 找不到 go 命令，无法编译 lark-cli。
+
+需要 Go >= 1.23.0（cli/go.mod 声明；所有 golang.org/x 依赖同样要求 1.23.0）。
+Kylin V10 / ARM64（飞腾、鲲鹏）可用官方静态工具链，例如：
+
+  curl -LO https://go.dev/dl/go1.23.12.linux-arm64.tar.gz
+  sudo rm -rf /usr/local/go
+  sudo tar -C /usr/local -xzf go1.23.12.linux-arm64.tar.gz
+  export PATH=/usr/local/go/bin:$PATH
+  go version
+
+注意：
+  * 版本必须 >= 1.23.0；低于此版本会报 "go.mod requires go >= 1.23.0"，
+    GOTOOLCHAIN=auto 还会尝试联网下载工具链（离线环境会失败）。
+  * 离线环境先在有网机器 go mod download，再拷贝 $GOPATH/pkg/mod，
+    或配置内网 GOPROXY；也可以直接在开发机交叉编译：
+    ./scripts/package.sh --target linux/arm64（CGO_ENABLED=0 静态产物）
+EOF
+    exit 1
+  fi
+  local go_ver minor
+  go_ver="$(go version 2>/dev/null | awk '{print $3}')"
+  minor="$(printf '%s' "${go_ver#go1.}" | cut -d. -f1)"
+  case "$minor" in
+    ''|*[!0-9]*) ;;  # devel 等非标准版本号，交给 go build 自己判断
+    *)
+      if [ "$minor" -lt 23 ]; then
+        echo "error: 交叉编译需要 Go >= 1.23.0，当前为 $go_ver" >&2
+        echo "       请升级 Go，或改用开发机交叉编译后拷贝产物。" >&2
+        exit 1
+      fi
+      ;;
+  esac
+  GO_TOOLCHAIN_CHECKED=1
+}
+
 build_cli() {
   local goos="$1" goarch="$2" out="$3"
+  ensure_go_toolchain
   echo "    go build GOOS=$goos GOARCH=$goarch -> $out"
   ( cd "$CLI_REPO" && CGO_ENABLED="$CGO_ENABLED" GOOS="$goos" GOARCH="$goarch" \
       go build -trimpath -ldflags "$CLI_LDFLAGS" -o "$out" . )
