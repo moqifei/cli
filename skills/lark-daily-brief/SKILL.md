@@ -4,7 +4,7 @@ version: 1.12.0
 description: "飞书每日简报 / 主动提醒基准技能：聚合今天@我且等我回的消息（区分已读未回与未读）、逾期与临期待办、待你回复的会议邀请、今晚与明天的日程（含冲突与连轴预警）、昨天开过的会留下了哪些纪要/回放，以及我自己文档上别人新留的未解决评论；每条标注优先级并给出建议动作，按优先级压成一条消息推给用户。既可在会话里手动触发（“生成今天的飞书简报”），也可被定时任务在无人值守下按 mode=digest（每天一次汇总，每天必发）或 mode=alert（临近事件巡检）调度。"
 metadata:
   requires:
-    bins: ["lark-cli"]
+    bins: []
     # 声明本技能会碰的权限域，而不是把飞书全部能力都要一遍。
     # 运行时会用这份清单**一次性**申请授权：用户点一次卡片即可，
     # 不会出现"授权完 im 又缺 calendar、再授权一次"的来回。
@@ -26,6 +26,26 @@ metadata:
     scopes: ["im:message:readonly", "im:message.reactions:read", "search:message", "calendar:calendar.event:read", "task:task:read", "vc:meeting.search:read", "vc:record:readonly", "vc:meeting.meetingevent:read", "search:docs:read", "docs:document.comment:read"]
   cliHelp: "lark-cli im --help"
 ---
+
+<!-- orange-lark-cli-adapter -->
+> **Orange 运行时（务必先读）**：本技能中出现的 `lark-cli <子命令> ...`，请改用工具 `lark_cli` 执行：
+> 把 `<子命令>` 及其参数按顺序放入 `argv` 数组，**不要**包含 `lark-cli` 前缀。
+> 例：`lark-cli docs +create --title 测试文档` → `lark_cli({"argv":["docs","+create","--title","测试文档"]})`。
+> 该工具已内置应用凭证（默认机器人身份）；`docs +create` 会自动使用**用户身份**，把文档建到用户自己的云空间。
+> 若返回 `awaiting_authorization: true`（系统**已自动**向用户发出授权卡片，且已一次性申请了本技能声明的全部权限域），
+> **本轮到此为止，唯一允许的输出是一句话**：「授权卡片已发送，点一下「去授权」，完成后我继续」。
+> **禁止**：输出简报正文、输出结果 JSON、把「待授权」写成一个条目、写"今天没有…"之类的结论、
+> 罗列权限名或 scope 名、教用户去开放平台点按钮、重试该命令、换别的工具替代。
+> 即使已经取到部分数据，也**整轮丢弃**：用户点完授权后系统会自动续跑，那一轮从零重新取数出完整结果。
+> 半份简报 + 一句"待授权"，是本适配层最严重的错误 —— 用户会以为今天真的只有这些。
+> 用户点完后系统自动续跑，用户不需要再发消息。
+> 若返回 `missing_scopes` 且带 `console_url`（**应用级**权限没开，用户点卡片也解决不了），
+> 只回一句「需要管理员在开放平台开通后重试」，把链接附上，不要展开步骤。
+>
+> **需要用户选择 / 确认时，用工具 `feishu_ask_user_question`**（表单卡片，答案会作为本会话下一条消息回来）。
+> 不要用 `lark_cli` 调 `im +messages-send` 手工拼一张卡片 —— 那样收不到提交回调，也无法把答案送回对话。
+> 该工具在本运行时**已经注册**，若你"感觉"没有，那是上下文里的旧结论，不代表它不存在。
+<!-- /orange-lark-cli-adapter -->
 
 # 飞书每日简报（主动提醒基准）
 
@@ -151,6 +171,15 @@ lark-cli im +messages-search --query "" --chat-type p2p --sender-type user \
 ```
 
 - `--query` 留空，靠筛选项限定范围；**不要**把"看看""总结"这类指令词塞进 `--query`，会把真正相关的消息过滤掉。
+- 每条结果都带 `source_label`（`<chat_name> · <sender.name>`，私聊是 `私聊 · <sender.name>`）：
+  CLI 已把**同一条消息**的群名和发言人绑成一个字段。后面写 `title` 时整段复制它，
+  **不要**自己拿 `chat_name` 和别的字段重新拼 —— 一页十几条结构相同的 JSON，
+  手工拼最容易把邻行的群名安到这条消息上。
+- `--start` / `--end` 一律写成带时区偏移的 ISO 8601（`2026-11-10T11:18:00+08:00`），
+  或直接用框架注入的 `<TODAY_START>` / `<NOW>`（本来就是这个格式）。飞书会拒绝
+  `2026-11-10 11:18` 这类展示格式并报 `99992402 field validation failed`。
+  消息的 `create_time` 常是展示格式，拿它当 `--start` 时先改写：空格换成 `T`、
+  补上 `:00+08:00`。**不要**为此调用 shell / date，也不要用原始字符串重试。
 - A1 结果里 `mentions[].id` 含我的 `openId` 才算出结果；`@所有人` 也算 @我。
 - **搜索结果里会混进我自己发的消息**（`--sender-type user` 不排除我）：`sender.id` 等于我的 `openId` 一律丢弃。
   不过滤会把"我发的消息"报成"我欠人回复"，这是最容易犯的误报。
@@ -184,11 +213,14 @@ lark-cli im +messages-read-status --as user --message-ids om_xxx,om_yyy --format
 **2）判断我回没回**（只对等待最久的**最多 5 个**会话做，不要全量扫）：
 
 ```bash
-lark-cli im +messages-search --query "" --chat-id <oc_xxx> \
-  --sender "<我在 Step 1 拿到的 openId>" --start "<该消息的 create_time>" --end "<NOW>" \
+lark-cli im +messages-search --query "" --chat-id "<这条消息自己的 chat_id>" \
+  --sender "<我在 Step 1 拿到的 openId>" --start "<该消息的 create_time，改写成 RFC3339>" --end "<NOW>" \
   --page-size 5 --format json --as user
 ```
 
+- `--chat-id` 必须逐字取**这条消息自己的** `chat_id`（和它的 `source_label` 同一个
+  `message_id`）。不要按群名、按印象、或按同批结果里另一条消息另选一个群：
+  查错群不仅会让标题写错群，还会把「已读未回」判成另一回事。
 - `data.total > 0`（或 `messages` 非空）→ 这条消息之后我在该会话发过言，视为**已回**，丢弃。
 - 请求失败、或候选会话超过 5 个 → 记为**未确认**，**不要丢弃**；此时即使 `is_read=true` 也**不能**
   断言"已读未回"，归入「未读待回」，文案写"已读，未确认是否已回"。
@@ -347,10 +379,10 @@ lark-cli drive +list-comments --url "<文档 URL>" --solved-status false --page-
 
 | 类别 | 判定 | 文案要点 |
 |---|---|---|
-| 已读未回 | A3 判为「已读未回」：对方看得到你读过，你却还没回 | 谁、在哪个群、问的什么、**几点问的**（绝对时间） |
+| 已读未回 | A3 判为「已读未回」：对方看得到你读过，你却还没回 | `source_label` 逐字、问的什么、**几点问的**（绝对时间） |
 | 卡住的事 | 逾期任务、今天到期的任务、待我处理的审批 | 什么事、等了多久、截止时间 |
 | 待你回复的邀请 | 日程 `self_rsvp_status == "needs_action"` | 谁邀请、什么会、什么时候、要你接受还是拒绝 |
-| 未读待回 | A3 判为「未读」或未确认，且是 @我 / 私聊问句 | 谁、在哪个群、要你做什么、几点发的 |
+| 未读待回 | A3 判为「未读」或未确认，且是 @我 / 私聊问句 | `source_label` 逐字、要你做什么、几点发的 |
 | 文档评论 | 我的文档上有别人留的未解决评论（近 36 小时） | 哪篇文档、谁、什么时候、说了什么（只取第一句） |
 | 快到点 | `alert` 模式下 30 分钟内开始的会；今天到期任务 | 几点、什么事、要几分钟准备 |
 | 冲突/连轴 | 日程重叠、≥3 个会连着且间隔 <15 分钟 | 撞的是哪两个、要不要改期 |
@@ -360,6 +392,7 @@ lark-cli drive +list-comments --url "<文档 URL>" --solved-status false --page-
 
 **按会话聚合，别让一个人刷屏**：同一个人在同一会话里的多条未回消息，合并成**一条**
 （`title` 用最要紧的那句，`detail` 写"共 N 条，最后一条 14:05"，`ref` 用最新一条的 `message_id`）。
+合并后的 `source_label` 仍取这几条**共同**的 `chat_name`，不要拿别的会话的群名来"顺口一写"。
 
 **必须丢弃**：闲聊、表情、接龙、广告、红包、我自己发的、机器人/系统通知、撤回消息（`deleted=true`）、
 同一件事的重复消息、纯通告无我无关的群发、`decline` 过的会议、已解决的旧评论。
@@ -384,7 +417,7 @@ lark-cli drive +list-comments --url "<文档 URL>" --solved-status false --page-
   "status": "delta",
   "summary": "今天 5 件事要关注：1 个已读未回、1 个等你批、1 个待回复邀请",
   "items": [
-    {"title": "「项目群」张三点名问你，你已读没回", "detail": "今天 10:12 问周报能不能 18:00 前给", "ref": "om_xxx", "priority": "now", "action": "现在回"},
+    {"title": "技术中台域&AI创新实验室 · 贺世博 @你，已读没回", "detail": "今天 10:12 问周报能不能 18:00 前给", "ref": "om_xxx", "priority": "now", "action": "现在回"},
     {"title": "报销单审批还卡在你这儿", "detail": "张三的差旅报销单，明天前要批", "ref": "ic_xxx:tk_xxx", "priority": "today", "action": "今天批"},
     {"title": "李四邀请你参加明天的评审", "detail": "明天 14:00 产品评审，李四在等答复", "ref": "evt_zzz", "priority": "today", "action": "回个话"},
     {"title": "李四私聊问你排期", "detail": "今天 09:30 发来，还没读", "ref": "om_yyy", "priority": "today", "action": "读一下"},
@@ -408,7 +441,16 @@ lark-cli drive +list-comments --url "<文档 URL>" --solved-status false --page-
 规则：
 
 - `summary` ≤ 40 字，一句话说清「几件事 + 偏哪类」，必须与 `items` 对得上。
-- `title` ≤ 30 字；`detail` ≤ 80 字，含「谁 + 什么事 + 什么时候」。
+- `title` ≤ 30 字；`detail` ≤ 80 字，含「谁 + 什么事 + 什么时候」。消息类条目若
+  `source_label` 本身就长，`title` 可放宽到 45 字，**不许为了凑字数截短群名**。
+- **群名只能逐字复制该条的 `source_label`**：消息类条目（已读未回 / 未读待回）的
+  `title` 必须以它开头。**禁止**简写（「屯数看数能力移植到汤圆」写成「汤圆项目群」）、
+  改写、按消息内容猜群名，或从同批结果里**另一条消息**借群名。真实事故：11:57 钟瑾在
+  「屯数看数能力移植到汤圆」@我，日报却写成「天策研发群钟瑾@你」—— 那个群名属于
+  同批结果里 15:09 卿红斌的另一条消息。
+- 一条 item 里的群名、发言人、时间、内容必须来自**同一个 `message_id`**。输出前逐条
+  对照搜索结果核对一次：从 `ref` 找到那条消息，确认 `title` 开头的群名等于它的
+  `chat_name`（或 `source_label` 的群名部分）。A3 回查的 `--chat-id` 同理。
 - **每条都带 `priority` 和 `action`**，让人一眼看出"先干什么、要我做什么"：
   - `priority`：`now`（现在就处理）／`today`（今天内）／`know`（知道就行）。渲染成 `❗`／`•`／`·`。
   - `action`：≤ 12 字、动词开头的动作短语 —— "现在回""今天批""回个话""进会""补看结论"。
@@ -506,7 +548,7 @@ lark-cli drive +list-comments --url "<文档 URL>" --solved-status false --page-
     {"name": "EHR 待办", "label": "EHR · 待审批", "hint": "待你处理的人事流程", "headers": ["序号", "流程名称", "申请人"]}
   ],
   "items": [
-    {"title": "技术中台群@所有人：更新项目进展，你已读未回", "detail": "贺世博今天 16:33 …", "ref": "om_xxx", "priority": "now", "action": "更新项目进展", "section": "飞书", "group": "群聊 · 已读未回"},
+    {"title": "技术中台域&AI创新实验室 · 贺世博 @你，已读未回", "detail": "贺世博今天 16:33 …", "ref": "om_xxx", "priority": "now", "action": "更新项目进展", "section": "飞书", "group": "群聊 · 已读未回"},
     {"title": "OA行收文：分行营业部印章使用申请（李四）", "detail": "formId 54，当前节点…，李四申请，已等 1 天", "ref": "oa-workflow:20261104002", "priority": "now", "action": "逐条审批", "section": "OA 待办", "group": "行收文", "cells": [2, "关于分行营业部印章使用的申请", "李四"], "note": "11-04 09:40 接收 · requestId 20261104002"},
     {"title": "EHR请假申请：张三", "detail": "张三的请假申请，待审批", "ref": "ehr-todo:20261104005", "priority": "today", "action": "逐条审批", "section": "EHR 待办", "group": "请假", "cells": [1, "请假申请", "张三"], "note": "requestId 20261104005"}
   ]
@@ -599,6 +641,9 @@ E/F 段的预检走的是同一条路：**日常巡检发现缺权限也直接�
 - ❌ 编一个不存在的会或截止时间。
 - ❌ 自己调 `im +messages-send` 把简报发出去（会收到两份）。
 - ❌ `detail` 里写"3 小时前"（每次运行都变，去重失效）。
+- ❌ 把 `chat_name` 简写成"某某项目群"、按消息内容猜群名，或把同批结果里另一条消息的
+  群名安到这条上：用户会看到「天策研发群钟瑾@你」这种找错群、找错人的标题。只用该条
+  `message_id` 的 `source_label`，逐字复制。
 - ❌ 按搜索结果原始顺序输出（顺序抖动 → 同批内容被重复推送）。
 - ❌ 把"有纪要"写成"纪要说……"：本部署读不到妙记正文，展开内容就是编造。
 - ❌ 没查过会话就把消息标成"已读未回"：查不动就写"还没读"，别替用户下结论。

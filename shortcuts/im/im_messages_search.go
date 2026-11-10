@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/larksuite/cli/errs"
 	"github.com/larksuite/cli/internal/output"
@@ -204,6 +205,9 @@ var ImMessagesSearch = common.Shortcut{
 		// Enrich: resolve sender names for outer messages (reuses cache from merge_forward)
 		convertlib.ResolveSenderNames(runtime, enriched, nameCache)
 		convertlib.AttachSenderNames(enriched, nameCache)
+		for _, msg := range enriched {
+			msg["source_label"] = messageSourceLabel(msg)
+		}
 		if !runtime.Bool("no-reactions") {
 			convertlib.EnrichReactions(runtime, enriched)
 		}
@@ -264,6 +268,47 @@ type messagesSearchRequest struct {
 	body   map[string]interface{}
 }
 
+// messageSourceLabel binds one message's chat and sender into a single
+// ready-to-copy label. Search results contain many similarly shaped rows; an
+// agent writing a digest used to take a chat_name from a neighbouring row and
+// attach it to the wrong message (a real brief said "天策研发群钟瑾@你" for a
+// message that actually came from "屯数看数能力移植到汤圆"). Pre-joining the
+// two fields removes that assembly step: consumers copy the label verbatim.
+func messageSourceLabel(msg map[string]interface{}) string {
+	chat := ""
+	if name, _ := msg["chat_name"].(string); name != "" {
+		chat = name
+	} else if chatType, _ := msg["chat_type"].(string); chatType == "p2p" {
+		chat = "私聊"
+	}
+	sender := ""
+	if s, ok := msg["sender"].(map[string]interface{}); ok {
+		sender = senderDisplay(s)
+	}
+	switch {
+	case chat != "" && sender != "":
+		return fmt.Sprintf("%s · %s", chat, sender)
+	case chat != "":
+		return chat
+	default:
+		return sender
+	}
+}
+
+// normalizeMessagesSearchTimestamp turns ParseTime's unix-seconds output back
+// into an RFC3339 timestamp. The search API rejects loose display values such
+// as "2026-11-10 11:18" with 99992402 field validation failed, even though
+// local validation accepts them. Passing the raw --start/--end value through
+// used to let those values reach the API and cost the agent a few extra turns
+// of guesswork before it happened to retry with an ISO timestamp.
+func normalizeMessagesSearchTimestamp(unixSeconds string) string {
+	seconds, err := strconv.ParseInt(unixSeconds, 10, 64)
+	if err != nil {
+		return unixSeconds
+	}
+	return time.Unix(seconds, 0).In(time.Local).Format(time.RFC3339)
+}
+
 func buildMessagesSearchRequest(runtime *common.RuntimeContext) (*messagesSearchRequest, error) {
 	query := runtime.Str("query")
 	chatFlag := runtime.Str("chat-id")
@@ -293,8 +338,7 @@ func buildMessagesSearchRequest(runtime *common.RuntimeContext) (*messagesSearch
 			return nil, errs.NewValidationError(errs.SubtypeInvalidArgument, "--start: %v", err).WithParam("--start")
 		}
 		startTs = ts
-		start := startFlag
-		timeRange["start_time"] = start
+		timeRange["start_time"] = normalizeMessagesSearchTimestamp(ts)
 	}
 	if endFlag != "" {
 		ts, err := common.ParseTime(endFlag, "end")
@@ -302,8 +346,7 @@ func buildMessagesSearchRequest(runtime *common.RuntimeContext) (*messagesSearch
 			return nil, errs.NewValidationError(errs.SubtypeInvalidArgument, "--end: %v", err).WithParam("--end")
 		}
 		endTs = ts
-		end := endFlag
-		timeRange["end_time"] = end
+		timeRange["end_time"] = normalizeMessagesSearchTimestamp(ts)
 	}
 	if startTs != "" && endTs != "" {
 		sv, _ := strconv.ParseInt(startTs, 10, 64)

@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/larksuite/cli/shortcuts/common"
 	"github.com/spf13/cobra"
@@ -33,13 +34,13 @@ func newMessagesSearchRuntime(t *testing.T, stringFlags map[string]string, boolF
 	runtime := newBotShortcutRuntime(t, rt)
 	cmd := &cobra.Command{Use: "test"}
 
-	stringFlagNames := []string{"query", "page-token", "at-chatter-ids"}
+	stringFlagNames := []string{"query", "page-token", "at-chatter-ids", "start", "end"}
 	for _, name := range stringFlagNames {
 		cmd.Flags().String(name, "", "")
 	}
 	cmd.Flags().Int("page-size", 20, "")
 	cmd.Flags().Int("page-limit", 20, "")
-	boolFlagNames := []string{"page-all"}
+	boolFlagNames := []string{"page-all", "no-reactions"}
 	for _, name := range boolFlagNames {
 		cmd.Flags().Bool(name, false, "")
 	}
@@ -59,6 +60,176 @@ func newMessagesSearchRuntime(t *testing.T, stringFlags map[string]string, boolF
 	runtime.Cmd = cmd
 	runtime.Format = "pretty"
 	return runtime
+}
+
+func TestImMessagesSearchNormalizesLooseTimeFlags(t *testing.T) {
+	// 日报技能会把消息展示用的 create_time（"2026-11-10 11:18"）直接塞进
+	// --start。飞书搜索 API 对这种格式返回 99992402，模型得白跑一轮才猜到
+	// 改成 ISO 8601。请求体必须由本地解析结果规范化，不能原样透传。
+	runtime := newMessagesSearchRuntime(t, map[string]string{
+		"query": "",
+		"start": "2026-11-10 10:31",
+		"end":   "2026-11-10 14:20:01",
+	}, nil, nil)
+
+	req, err := buildMessagesSearchRequest(runtime)
+	if err != nil {
+		t.Fatalf("buildMessagesSearchRequest() error = %v", err)
+	}
+	filter, ok := req.body["filter"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("body has no filter: %#v", req.body)
+	}
+	timeRange, ok := filter["time_range"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("filter has no time_range: %#v", filter)
+	}
+
+	for flag, tc := range map[string]struct {
+		input  string
+		layout string
+	}{
+		"start_time": {"2026-11-10 10:31", "2006-01-02 15:04"},
+		"end_time":   {"2026-11-10 14:20:01", "2006-01-02 15:04:05"},
+	} {
+		parsed, err := time.ParseInLocation(tc.layout, tc.input, time.Local)
+		if err != nil {
+			t.Fatalf("ParseInLocation(%q) error = %v", tc.input, err)
+		}
+		want := parsed.Format(time.RFC3339)
+		if got, _ := timeRange[flag].(string); got != want {
+			t.Errorf("%s = %q, want RFC3339 %q", flag, got, want)
+		}
+	}
+
+	// 已经是 RFC3339 的输入必须保持原样，不能改变既有正确调用。
+	runtime = newMessagesSearchRuntime(t, map[string]string{
+		"start": "2026-11-10T11:18:00+08:00",
+	}, nil, nil)
+	req, err = buildMessagesSearchRequest(runtime)
+	if err != nil {
+		t.Fatalf("buildMessagesSearchRequest() error = %v", err)
+	}
+	timeRange = req.body["filter"].(map[string]interface{})["time_range"].(map[string]interface{})
+	if got, _ := timeRange["start_time"].(string); !strings.HasPrefix(got, "2026-11-10T11:18:00") {
+		t.Errorf("RFC3339 input was rewritten to %q", got)
+	}
+}
+
+func TestImMessagesSearchSourceLabelStaysWithItsOwnMessage(t *testing.T) {
+	// 日报里出现过「天策研发群钟瑾@你」：群名取到了同一批结果里另一条消息
+	// 的 chat_name。source_label 必须由每条消息自己的 chat_id / sender 拼出。
+	runtime := newMessagesSearchRuntime(t, map[string]string{"query": ""},
+		map[string]bool{"no-reactions": true},
+		shortcutRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			switch {
+			case strings.Contains(req.URL.Path, "/open-apis/im/v1/messages/search"):
+				return shortcutJSONResponse(200, map[string]interface{}{
+					"code": 0,
+					"data": map[string]interface{}{
+						"items": []interface{}{
+							map[string]interface{}{"meta_data": map[string]interface{}{"message_id": "om_a"}},
+							map[string]interface{}{"meta_data": map[string]interface{}{"message_id": "om_b"}},
+						},
+						"has_more": false,
+					},
+				}), nil
+			case strings.Contains(req.URL.Path, "/open-apis/im/v1/messages/mget"):
+				items := make([]interface{}, 0, 2)
+				for _, id := range req.URL.Query()["message_ids"] {
+					chatID, name := "oc_a", "钟瑾"
+					if id == "om_b" {
+						chatID, name = "oc_b", "卿红斌"
+					}
+					items = append(items, map[string]interface{}{
+						"message_id":  id,
+						"msg_type":    "text",
+						"create_time": "1710000000",
+						"chat_id":     chatID,
+						"sender": map[string]interface{}{
+							"id": "ou_" + name, "name": name, "sender_type": "user",
+						},
+						"body": map[string]interface{}{"content": `{"text":"ping"}`},
+					})
+				}
+				return shortcutJSONResponse(200, map[string]interface{}{
+					"code": 0,
+					"data":  map[string]interface{}{"items": items},
+				}), nil
+			case strings.Contains(req.URL.Path, "/open-apis/im/v1/chats/batch_query"):
+				return shortcutJSONResponse(200, map[string]interface{}{
+					"code": 0,
+					"data": map[string]interface{}{
+						"items": []interface{}{
+							map[string]interface{}{"chat_id": "oc_a", "chat_mode": "group", "name": "屯数看数能力移植到汤圆"},
+							map[string]interface{}{"chat_id": "oc_b", "chat_mode": "group", "name": "天策研发群(2025)"},
+						},
+					},
+				}), nil
+			default:
+				return nil, fmt.Errorf("unexpected request: %s", req.URL.String())
+			}
+		}))
+	runtime.Format = "json"
+
+	if err := ImMessagesSearch.Execute(context.Background(), runtime); err != nil {
+		t.Fatalf("ImMessagesSearch.Execute() error = %v", err)
+	}
+
+	outBuf, _ := runtime.Factory.IOStreams.Out.(*bytes.Buffer)
+	if outBuf == nil {
+		t.Fatal("stdout buffer missing")
+	}
+	var envelope map[string]interface{}
+	if err := json.Unmarshal(outBuf.Bytes(), &envelope); err != nil {
+		t.Fatalf("output is not JSON (%v): %s", err, outBuf.String())
+	}
+	data, _ := envelope["data"].(map[string]interface{})
+	if data == nil {
+		data = envelope
+	}
+	messages, _ := data["messages"].([]interface{})
+	if len(messages) != 2 {
+		t.Fatalf("messages = %d, want 2; output=%s", len(messages), outBuf.String())
+	}
+	want := map[string]string{
+		"om_a": "屯数看数能力移植到汤圆 · 钟瑾",
+		"om_b": "天策研发群(2025) · 卿红斌",
+	}
+	for _, raw := range messages {
+		m, _ := raw.(map[string]interface{})
+		id, _ := m["message_id"].(string)
+		if got, _ := m["source_label"].(string); got != want[id] {
+			t.Errorf("message %s source_label = %q, want %q", id, got, want[id])
+		}
+	}
+}
+
+func TestMessageSourceLabelHandlesP2PAndMissingNames(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  map[string]interface{}
+		want string
+	}{
+		{"group", map[string]interface{}{
+			"chat_name": "技术中台域&AI创新实验室",
+			"sender":    map[string]interface{}{"name": "贺世博"},
+		}, "技术中台域&AI创新实验室 · 贺世博"},
+		{"p2p", map[string]interface{}{
+			"chat_type": "p2p",
+			"sender":    map[string]interface{}{"name": "赵言"},
+		}, "私聊 · 赵言"},
+		{"no chat name", map[string]interface{}{
+			"sender": map[string]interface{}{"name": "钟瑾"},
+		}, "钟瑾"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := messageSourceLabel(tc.msg); got != tc.want {
+				t.Errorf("source_label = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }
 
 func TestImMessagesSearchExecuteAutoPaginationBatches(t *testing.T) {
