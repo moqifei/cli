@@ -157,6 +157,44 @@ export function accountsFromChannelConfig(api) {
 }
 
 /**
+ * 用户 UAT 不在 `data/lark-cli/<account>` 里：lark-cli 把它加密存在自己的
+ * 全局目录（macOS `~/Library/Application Support/lark-cli`，Linux
+ * `~/.local/share/lark-cli`，或 `$LARKSUITE_CLI_DATA_DIR/lark-cli`），文件名是
+ * `safeFileName("<appId>:<openId>")` = `<appId>_<openId>.enc`。
+ *
+ * 运维把 `data/lark-cli` 当缓存清掉后，插件重建 config.json 会写 `users: []`，
+ * `auth status` 就报「未登录」，但 token 其实还好好的。CLI 的 auth list/status
+ * 只读这个索引、不会扫描 .enc，授权门又要工具报错才触发，系统自己走不出这个
+ * 死循环。这里按**精确文件名**把索引认回来：不跑 OAuth、不覆盖 token、
+ * 不需要用户说一句话或点授权卡。
+ *
+ * 只对按人目录回填；`work` / `default` 这类共享目录保持 `users: []`，
+ * 否则会把 A 的 user token 记到 B 头上（见 ensureOwnerAccount 的注释）。
+ */
+function larkCliCredentialDir() {
+  const override = String(process.env.LARKSUITE_CLI_DATA_DIR || "").trim();
+  if (override) return path.join(override, "lark-cli");
+  const home = os.homedir();
+  return process.platform === "darwin"
+    ? path.join(home, "Library", "Application Support", "lark-cli")
+    : path.join(home, ".local", "share", "lark-cli");
+}
+
+function existingUserIndex(appId, accountId) {
+  const id = String(accountId || "");
+  const app = String(appId || "");
+  if (!/^ou_[A-Za-z0-9]+$/.test(id) || !/^[A-Za-z0-9_.-]+$/.test(app)) return [];
+  const enc = path.join(larkCliCredentialDir(), `${app}_${id}.enc`);
+  try {
+    if (!fs.statSync(enc).isFile()) return [];
+  } catch {
+    return [];
+  }
+  // core.AppUser 只有 userOpenId / userName；后者不参与寻址，留空即可。
+  return [{ userOpenId: id, userName: "" }];
+}
+
+/**
  * 企业首装兜底：`channels.feishu.accounts` 里已有 appId/appSecret 时，把它
  * 落成 lark-cli 的 `config.json`。没有这一步，gateway 能起来、插件也能加载，
  * 但每次 send 都报 `[config/not_configured] not configured`。
@@ -180,20 +218,21 @@ function seedCliAppConfig(configDir, cfg, chan, log) {
     fs.writeFileSync(secretPath, secret, { mode: 0o600 });
     fs.chmodSync(secretPath, 0o600);
     const brand = asString(cfg?.brand ?? chan?.domain, "feishu") === "lark" ? "lark" : "feishu";
+    const users = existingUserIndex(appId, path.basename(configDir));
     const config = {
       apps: [
         {
           appId,
           appSecret: { source: "file", id: secretPath },
           brand,
-          users: [],
+          users,
         },
       ],
     };
     fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
     fs.chmodSync(configPath, 0o600);
     log?.info?.(
-      `seeded lark-cli config for ${appId} in ${configDir} (file-backed app secret, users empty)`,
+      `seeded lark-cli config for ${appId} in ${configDir} (file-backed app secret, users ${users.length ? "restored from existing credential" : "empty"})`,
     );
   } catch (error) {
     log?.warn?.(`failed to seed lark-cli config in ${configDir}: ${error?.message ?? error}`);
@@ -862,7 +901,8 @@ function ensureOwnerAccount(accountId, template) {
     const app = readAppCredential(template?.configDir);
     if (!app) return null;
     try {
-      fs.writeFileSync(configPath, JSON.stringify({ apps: [{ ...app, users: [] }] }, null, 2), {
+      const users = existingUserIndex(app?.appId, id);
+      fs.writeFileSync(configPath, JSON.stringify({ apps: [{ ...app, users }] }, null, 2), {
         mode: 0o600,
       });
     } catch {
