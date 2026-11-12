@@ -195,7 +195,7 @@ async function main() {
   if (argv[0] === "api") {
     const method = argv[1];
     const apiPath = argv[2] || "";
-    await readStdin();
+    const body = await readStdin();
     if (method === "POST" && apiPath === "/open-apis/cardkit/v1/cards") {
       const cardId = `card_fake_${Date.now().toString(36)}`;
       recordSend({ at: new Date().toISOString(), kind: "cardkit_create", card_id: cardId });
@@ -203,7 +203,51 @@ async function main() {
       return;
     }
     if (method === "PUT" || method === "PATCH") {
-      recordSend({ at: new Date().toISOString(), kind: "cardkit_update", path: apiPath });
+      let payload = {};
+      try {
+        payload = JSON.parse(body);
+      } catch {
+        /* keep empty payload for malformed requests */
+      }
+      let settings = payload.settings;
+      if (typeof settings === "string") {
+        try {
+          settings = JSON.parse(settings);
+        } catch {
+          settings = {};
+        }
+      }
+      // 人为放大 settings PATCH 的窗口，用来复现「首帧内容抢在开关之前发出」的竞态。
+      const delay = Number(process.env.FAKE_LARK_SETTINGS_DELAY_MS || 0);
+      if (method === "PATCH" && delay > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+      // 让第一次 settings PATCH 返回线上那种 sequence number compare failed，
+      // 验证收尾关流式会换更大的 sequence 重试。
+      const marker = `${sendLog}.patch-failed`;
+      if (
+        process.env.FAKE_LARK_FAIL_FIRST_SETTINGS_PATCH === "1" &&
+        method === "PATCH" &&
+        !fs.existsSync(marker)
+      ) {
+        fs.writeFileSync(marker, "1");
+        envelope(
+          {
+            ok: false,
+            error: { type: "api", subtype: "unknown", message: "sequence number compare failed" },
+          },
+          1,
+        );
+        return;
+      }
+      recordSend({
+        at: new Date().toISOString(),
+        kind: "cardkit_update",
+        method,
+        path: apiPath,
+        sequence: payload.sequence ?? null,
+        streaming_mode: settings?.streaming_mode ?? null,
+      });
       envelope({ ok: true, data: {} });
       return;
     }

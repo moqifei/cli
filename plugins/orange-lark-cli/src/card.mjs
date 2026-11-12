@@ -72,7 +72,7 @@ function reasoningPanel({ text, active, expanded, elapsedMs }) {
     border: { color: "grey", corner_radius: "5px" },
     vertical_spacing: "8px",
     padding: "8px 8px 8px 8px",
-    elements: [{ tag: "markdown", content: text, text_size: "notation" }],
+    elements: [{ tag: "markdown", content: stripThinkTags(text), text_size: "notation" }],
   };
 }
 
@@ -194,12 +194,61 @@ function footerElements({ footer, elapsedMs, metrics, isError, isAborted }) {
 
 // ── summary（会话列表预览） ──────────────────────────────────────────────
 
+// 对齐旧插件 openclaw-lark/src/card/builder.ts 的推理标签处理：
+// <think> / <thinking> / <thought> / <antthinking>，含带空格与未闭合变体。
+const THINK_SCAN_RE = /<\s*(\/?)\s*(?:think(?:ing)?|thought|antthinking)\s*>/gi;
+const THINK_BLOCK_RE = /<\s*(?:think(?:ing)?|thought|antthinking)\s*>[\s\S]*?<\s*\/\s*(?:think(?:ing)?|thought|antthinking)\s*>/gi;
+const THINK_UNCLOSED_RE = /<\s*(?:think(?:ing)?|thought|antthinking)\s*>[\s\S]*$/gi;
+const THINK_ORPHAN_RE = /<\s*\/\s*(?:think(?:ing)?|thought|antthinking)\s*>/gi;
+const EMPTY_REPLY_FALLBACK = "Done.";
+
+/** 提取标签内的推理文本（含未闭合标签），用于送进思考面板。 */
+export function extractThinkingContent(text) {
+  const source = String(text ?? "");
+  const scanRe = new RegExp(THINK_SCAN_RE.source, "gi");
+  let result = "";
+  let lastIndex = 0;
+  let inThinking = false;
+  for (const match of source.matchAll(scanRe)) {
+    const idx = match.index ?? 0;
+    if (inThinking) result += source.slice(lastIndex, idx);
+    inThinking = match[1] !== "/";
+    lastIndex = idx + match[0].length;
+  }
+  if (inThinking) result += source.slice(lastIndex);
+  return result.trim();
+}
+
+/** 正文 / 预览清洗：完整块、未闭合块、孤立闭合标签、`Reasoning:` 前缀。 */
+export function stripThinkTags(text) {
+  const source = String(text ?? "");
+  if (REASONING_PREFIX.test(source)) return "";
+  return source
+    .replace(THINK_BLOCK_RE, "")
+    .replace(THINK_UNCLOSED_RE, "")
+    .replace(THINK_ORPHAN_RE, "")
+    .trim();
+}
+
+/** dispatcher 入口用：拆出推理文本，剩下的才是能给用户看的正文。 */
+export function splitReasoningText(text) {
+  if (typeof text !== "string" || !text.trim()) return { answerText: text ?? "" };
+  if (REASONING_PREFIX.test(text)) {
+    return { reasoningText: cleanReasoningText(text), answerText: "" };
+  }
+  const reasoningText = extractThinkingContent(text);
+  const answerText = stripThinkTags(text);
+  if (!reasoningText && answerText === text) return { answerText: text };
+  return { reasoningText: reasoningText || undefined, answerText: answerText || undefined };
+}
+
 function summaryOf(text) {
-  const plain = String(text ?? "")
+  const plain = stripThinkTags(text)
     .replace(/[*_`#>[\]()~]/g, "")
     .trim();
-  if (!plain) return undefined;
-  return { content: plain.slice(0, 120) };
+  // 终帧 summary 恒非空：空回答时若不下发 summary，服务端会保留建卡时的
+  // 「处理中...」预览，会话列表就一直显示「[生成中...]」。
+  return { content: (plain || EMPTY_REPLY_FALLBACK).slice(0, 120) };
 }
 
 function baseConfig({ summary, streaming }) {
@@ -207,7 +256,9 @@ function baseConfig({ summary, streaming }) {
     wide_screen_mode: true,
     update_multi: true,
     locales: ["zh_cn", "en_us"],
-    ...(streaming ? { streaming_mode: true } : {}),
+    // 终帧显式写 false：CardKit 在流式模式下会把会话列表预览锁成「[生成中...]」，
+    // 让终帧卡片自己带上「非流式」语义，不完全依赖 settings 接口的时序。
+    streaming_mode: Boolean(streaming),
     ...(summary ? { summary } : {}),
   };
 }
@@ -280,7 +331,7 @@ export function buildStreamingCard({
     elements.push(activeToolPanel({ steps, elapsedMs: stepsElapsedMs }));
   }
 
-  const answer = String(answerText ?? "");
+  const answer = stripThinkTags(answerText);
   if (reasoningText) {
     elements.push(
       reasoningPanel({
@@ -353,7 +404,7 @@ export function buildCompleteCard({
       }),
     );
   }
-  const body = String(text ?? "").trim();
+  const body = stripThinkTags(text);
   elements.push({
     tag: "markdown",
     content: body ? optimizeMarkdownStyle(body) : "（本轮没有产生文本输出）",

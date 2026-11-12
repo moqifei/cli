@@ -56,6 +56,9 @@ export class StreamingReply {
     this.sequence = 0;
     this.failed = false;
     this.closed = false;
+    // 终态闸门：finish() 一进入就置位，阻止迟到的 flush 把终帧覆盖成流式态。
+    this.finalizing = false;
+    this.streamingClosed = false;
 
     this.startPromise = null;
     this.lastFlushAt = 0;
@@ -76,14 +79,53 @@ export class StreamingReply {
   }
 
   /**
+   * 关闭 CardKit 的 streaming_mode。旧插件只在收尾关一次，从不做开场
+   * PATCH(true)——开启只写在建卡 JSON 里，因此不存在 PATCH/PUT 抢号的窗口。
+   *
+   * sequence 是服务端单调递增值：失败必须换更大的号重试；两次都失败要
+   * 让调用方知道（返回 false），不能再静默吞掉，否则卡片停在流式态、
+   * 会话列表一直显示「[生成中...]」。
+   */
+  async _closeStreamingMode(cardId) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await updateCardSettings(
+          this.account,
+          cardId,
+          { streaming_mode: false },
+          ++this.sequence,
+          { log: this.log },
+        );
+        return true;
+      } catch (error) {
+        const message = error?.message ?? String(error);
+        if (attempt === 0) {
+          this.log.warn(`card streaming off failed, retrying: ${message}`);
+        } else {
+          this.log.error(`card streaming off failed: ${message}`);
+        }
+      }
+    }
+    return false;
+  }
+
+  /** 所有放弃路径都尝试收尾一次，且只收尾一次。 */
+  async _closeStreamingSafely(cardId) {
+    if (!cardId || this.streamingClosed) return;
+    this.streamingClosed = true;
+    await this._closeStreamingMode(cardId);
+  }
+
+  /**
    * 建卡 + 发消息。幂等：并发调用共享同一个 promise。
    *
    * 这一步必须在 dispatch 一开始就调用，而不是等第一段文字。
    */
   async ensureStarted() {
+    // 并发调用共享同一个 promise，避免建卡 / 发消息被重复执行。
+    if (this.startPromise) return this.startPromise;
     if (this.cardId) return this.cardId;
     if (this.failed || this.closed) return null;
-    if (this.startPromise) return this.startPromise;
 
     this.startPromise = (async () => {
       try {
@@ -106,13 +148,9 @@ export class StreamingReply {
         this.log.info(
           `streaming card created for ${this.to}${this.replyToMessageId ? ` (reply to ${this.replyToMessageId})` : ""} card_id=${cardId}`,
         );
-        // streaming_mode 必须在第一次内容更新之前打开，否则飞书会把每帧渲染成
-        // 「卡片已更新」而不是打字机效果。
-        await updateCardSettings(this.account, cardId, { streaming_mode: true }, ++this.sequence, {
-          log: this.log,
-        }).catch((error) => {
-          this.log.warn(`card streaming settings failed: ${error?.message ?? error}`);
-        });
+        // streaming_mode 由建卡 JSON（buildThinkingCard）开启，不做开场
+        // PATCH(true)：旧插件就是这么做的，少一次请求也就没有抢 sequence
+        // 的窗口，第一次内容更新直接用 seq=1。
         return cardId;
       } catch (error) {
         this.failed = true;
@@ -132,6 +170,18 @@ export class StreamingReply {
     if (!cleaned) return;
     if (!this.reasoningStartedAt) this.reasoningStartedAt = Date.now();
     this.reasoning = cleaned;
+    this.reasoningActive = true;
+    this.schedule({ reasoning: true });
+  }
+
+  /** dispatcher 入口从 <think> 标签里拆出的推理文本，补进思考面板。 */
+  onExtractedThinking(text) {
+    if (!this.reasoningEnabled || this.finalizing || this.closed) return;
+    const cleaned = cleanReasoningText(text);
+    // reasoning 流已经给过内容时不要重复追加，避免面板里出现两份思考。
+    if (!cleaned || this.reasoning.trim()) return;
+    this.reasoning = cleaned;
+    if (!this.reasoningStartedAt) this.reasoningStartedAt = Date.now();
     this.reasoningActive = true;
     this.schedule({ reasoning: true });
   }
@@ -196,7 +246,14 @@ export class StreamingReply {
   }
 
   schedule({ reasoning = false, force = false } = {}) {
-    if (this.failed || this.closed) return;
+    // 终态闸门：一旦进入 finish()，不允许再排任何流式帧。旧插件靠
+    // flush.complete()/cancelPendingFlush() 保证终帧之后没有 PUT，
+    // 否则迟到帧会带着 config.streaming_mode=true 把终帧覆盖回去。
+    if (this.failed || this.closed || this.finalizing) return;
+    if (force && this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
     const interval = reasoning && !force ? REASONING_FLUSH_INTERVAL_MS : FLUSH_INTERVAL_MS;
     const elapsed = Date.now() - this.lastFlushAt;
     const wait = force ? 0 : Math.max(0, interval - elapsed);
@@ -214,7 +271,7 @@ export class StreamingReply {
   }
 
   async flush() {
-    if (this.failed || this.closed) return;
+    if (this.failed || this.closed || this.finalizing) return;
     if (this.inFlight) {
       // 合并：后续帧只保留一帧，无论期间来了多少次更新。
       this.pending = true;
@@ -224,7 +281,7 @@ export class StreamingReply {
     this.inFlight = (async () => {
       try {
         const cardId = await this.ensureStarted();
-        if (!cardId || this.failed || this.closed) return;
+        if (!cardId || this.failed || this.closed || this.finalizing) return;
         await updateCard(
           this.account,
           cardId,
@@ -270,6 +327,12 @@ export class StreamingReply {
    */
   async finish(finalText, { isError = false } = {}) {
     if (this.closed) return this.active;
+    if (this.finalizing) return this.active;
+    // 闸门必须在任何 await 之前置位：flush() 的 finally 会重新 schedule 一帧，
+    // 迟到帧会带着 config.streaming_mode=true 把终帧覆盖回去。旧插件靠
+    // flush.complete()/cancelPendingFlush() 杜绝这条路径。
+    this.finalizing = true;
+
     if (typeof finalText === "string" && finalText.trim()) {
       this.answer = finalText;
     }
@@ -291,52 +354,61 @@ export class StreamingReply {
       return true;
     }
 
+    // 任何放弃路径都要先关流式，否则已发出的卡会永远停在「[生成中...]」。
     if (this.failed) {
+      await this._closeStreamingSafely(this.cardId);
       this.closed = true;
       return false;
     }
 
     const cardId = await this.ensureStarted();
     if (!cardId || this.failed) {
+      await this._closeStreamingSafely(this.cardId);
       this.closed = true;
       return false;
     }
 
+    // 闸门已置位，inFlight 的 finally 不会再排新帧。
     if (this.inFlight) await this.inFlight.catch(() => {});
 
-    try {
-      await updateCard(
-        this.account,
-        cardId,
-        buildCompleteCard({
-          text: this.answer,
-          steps: this.steps,
-          stepsElapsedMs: this.toolsElapsedMs,
-          reasoningText: this.reasoningEnabled ? this.reasoning : "",
-          reasoningElapsedMs: this.reasoningElapsedMs || undefined,
-          reasoningExpanded: this.reasoningExpanded,
-          reasoningEnabled: this.reasoningEnabled,
-          showToolUse: this.showToolUse,
-          footer: this.footer,
-          elapsedMs: Date.now() - this.startedAt,
-          isError,
-        }),
-        ++this.sequence,
-        { log: this.log },
-      );
-      await updateCardSettings(this.account, cardId, { streaming_mode: false }, ++this.sequence, {
-        log: this.log,
-      }).catch((error) => {
-        this.log.warn(`card streaming shutdown failed: ${error?.message ?? error}`);
-      });
-      this.closed = true;
-      return true;
-    } catch (error) {
-      this.log.warn(`final card update failed: ${error?.message ?? error}`);
-      this.failed = true;
-      this.closed = true;
-      return false;
+    const finalCard = buildCompleteCard({
+      text: this.answer,
+      steps: this.steps,
+      stepsElapsedMs: this.toolsElapsedMs,
+      reasoningText: this.reasoningEnabled ? this.reasoning : "",
+      reasoningElapsedMs: this.reasoningElapsedMs || undefined,
+      reasoningExpanded: this.reasoningExpanded,
+      reasoningEnabled: this.reasoningEnabled,
+      showToolUse: this.showToolUse,
+      footer: this.footer,
+      elapsedMs: Date.now() - this.startedAt,
+      isError,
+    });
+
+    // 与旧插件 onIdle 一致：先 PATCH(false)，再终帧 PUT。关失败也要发终帧，
+    // 终帧 card JSON 显式 streaming_mode:false 是第二道保险。
+    const streamingOff = await this._closeStreamingMode(cardId);
+    if (streamingOff) this.streamingClosed = true;
+    else this.log.warn("streaming mode may still be on; final card carries streaming_mode=false");
+
+    // 终帧失败换更大的 sequence 重试一次，不再一次失败就遗弃整张卡。
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await updateCard(this.account, cardId, finalCard, ++this.sequence, { log: this.log });
+        this.closed = true;
+        return true;
+      } catch (error) {
+        const message = error?.message ?? String(error);
+        if (attempt === 0) {
+          this.log.warn(`final card update failed, retrying: ${message}`);
+        } else {
+          this.log.error(`final card update failed: ${message}`);
+        }
+      }
     }
+    this.failed = true;
+    this.closed = true;
+    return false;
   }
 
   /** dispatch 结束时没有 final delivery 的兜底。 */

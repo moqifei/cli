@@ -19,6 +19,20 @@ function cardArgs(account, method, path) {
   return ["api", method, path, "--as", "bot", "--data", "-", "--format", "json"];
 }
 
+/**
+ * HTTP 200 / exit 0 不等于 CardKit 成功：业务错误放在响应体 `code` 里
+ * （230020 限流、230099 表格超限、sequence number compare failed 等）。
+ * 旧插件 openclaw-lark/src/card/cardkit.ts 对四个 API 都做 fail-fast；
+ * 少了这层就会把「假成功」当成已落地，继续推进 sequence、丢掉终帧。
+ */
+function assertCardKitOk(result, api) {
+  const body = result?.envelope?.data ?? result?.data ?? {};
+  const code = body?.code ?? result?.envelope?.code;
+  if (typeof code === "number" && code !== 0) {
+    throw new Error(`cardkit ${api} failed: code=${code} msg=${body?.msg ?? ""}`);
+  }
+}
+
 export async function createCard(account, card, { log, timeoutMs = 20_000 } = {}) {
   const result = await runCli({
     cliPath: account.cliPath,
@@ -30,6 +44,7 @@ export async function createCard(account, card, { log, timeoutMs = 20_000 } = {}
     env: account.env,
     log,
   });
+  assertCardKitOk(result, "create");
   const data = result.data ?? {};
   const cardId = data.card_id ?? data?.data?.card_id;
   if (!cardId) throw new Error("cardkit create returned no card_id");
@@ -37,7 +52,7 @@ export async function createCard(account, card, { log, timeoutMs = 20_000 } = {}
 }
 
 export async function updateCard(account, cardId, card, sequence, { log, timeoutMs = 20_000 } = {}) {
-  await runCli({
+  const result = await runCli({
     cliPath: account.cliPath,
     configDir: account.configDir,
     cwd: account.scratchDir,
@@ -50,15 +65,16 @@ export async function updateCard(account, cardId, card, sequence, { log, timeout
     env: account.env,
     log,
   });
+  assertCardKitOk(result, "update");
 }
 
 /**
- * Toggle `streaming_mode`. Turned on for the first frame so Feishu animates the
- * card instead of showing "card updated" hints, and off at the end so the
- * finish state is stable.
+ * Close `streaming_mode`. Opening is done by the card JSON at creation time —
+ * matching the old openclaw-lark plugin, which never issues a PATCH(true) and
+ * therefore has no PATCH/PUT sequence race. Closing is the only settings call.
  */
 export async function updateCardSettings(account, cardId, settings, sequence, { log } = {}) {
-  await runCli({
+  const result = await runCli({
     cliPath: account.cliPath,
     configDir: account.configDir,
     cwd: account.scratchDir,
@@ -68,4 +84,5 @@ export async function updateCardSettings(account, cardId, settings, sequence, { 
     env: account.env,
     log,
   });
+  assertCardKitOk(result, "settings");
 }

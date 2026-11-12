@@ -55,6 +55,7 @@ import {
   resolveProxyConfig,
 } from "./proxy.mjs";
 import { buildBriefCard } from "./brief-card.mjs";
+import { splitReasoningText } from "./card.mjs";
 import { looksLikeEnvelope, renderDeltaForUser } from "./render.mjs";
 import { registerHttpTokenInjector } from "./http-token-injector.mjs";
 import { createUserTools } from "./user-tools.mjs";
@@ -727,6 +728,17 @@ class AccountRuntime {
       });
     };
 
+    // 对齐旧插件 reply-dispatcher.ts 的 getVisiblePayloadText()：在 dispatcher
+    // 入口统一拆推理标签，而不是只在 card builder 里清。卡片、纯文本降级、
+    // 非卡片模式等所有出口都走这里，`</think>` 才不会字面出现在回复里。
+    const visibleText = (raw) => {
+      const split = splitReasoningText(raw);
+      if (split.reasoningText && stream && !stream.failed && !stream.finalizing) {
+        stream.onExtractedThinking(split.reasoningText);
+      }
+      return split.answerText ?? "";
+    };
+
     const { dispatcher, replyOptions } = replyRuntime.createReplyDispatcherWithTyping({
       deliver: async (payload, info) => {
         const kind = info?.kind ?? "final";
@@ -735,10 +747,12 @@ class AccountRuntime {
         // Swapping in the one-line pointer is what turns a misleading
         // "半份简报 + 待授权" into the single sentence the adapter asks for.
         const sourceText = typeof payload?.text === "string" ? payload.text : "";
+        // 授权等待期间不要拆标签（模型内容一律不外泄），其余出口统一清洗。
+        const visibleSource = gated ? sourceText : visibleText(sourceText);
         // delta 信封是给调度器判重用的，不是给用户看的。cron 投递在 Rust 侧
         // 已经渲染（orange/src/proactive/render.rs），会话里手动跑一次走的是
         // 这里，以前会把整段 JSON 直接贴到飞书。
-        const text = gated ? AUTH_WAIT_LINE : (renderDeltaForUser(sourceText) ?? sourceText);
+        const text = gated ? AUTH_WAIT_LINE : (renderDeltaForUser(visibleSource) ?? visibleSource);
         if (!text.trim()) return;
 
         if (kind === "final") {
@@ -778,7 +792,8 @@ class AccountRuntime {
             // Never stream a brief that is about to be replaced by the gate,
             // and never stream a half-written JSON envelope.
             if (isAuthGated() || looksLikeEnvelope(payload?.text)) return;
-            stream.onAnswer(payload?.text);
+            const visible = visibleText(payload?.text ?? "");
+            if (visible.trim()) stream.onAnswer(visible);
           },
           onReasoningStream: (payload) => stream.onReasoning(payload?.text),
           onReasoningEnd: () => stream.onReasoningEnd(),

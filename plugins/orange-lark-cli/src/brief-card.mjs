@@ -20,13 +20,9 @@
  * ordinary single-source briefs keep their old message byte-for-byte.
  */
 
-import { parseBriefLayout, plainLine } from "./render.mjs";
+import { parseBriefLayout, plainLine, visibleTabItems } from "./render.mjs";
 
-/**
- * tab 版式的明细上限。沿用平铺的 10 条会把排在最后的整个来源截没，
- * 连 tab 条都消失；日报三来源合起来常有一二十条，这里放宽到 30。
- */
-const MAX_TAB_ITEMS = 30;
+/** 明细上限按来源计算，与纯文本回退共用 render.mjs 的 visibleTabItems。 */
 /** 飞书硬限制：单张卡片最多 5 个 table 组件。 */
 const MAX_TABLES = 5;
 /** 官方文档上限：表格最多 50 列。 */
@@ -162,7 +158,7 @@ export function buildBriefCard(text) {
   const { summary, items, sections } = layout;
   if (!items.some((item) => item.section)) return null;
 
-  const visible = items.slice(0, MAX_TAB_ITEMS);
+  const visible = visibleTabItems(items);
   // tab 存在性基于**完整** items：声明过的来源即使本轮没取到明细也要保留
   // tab 位并给出提示，不能让「summary 说有 6 条、下面连 tab 都没有」静默发生。
   const order = tabOrder(items, sections);
@@ -286,7 +282,7 @@ export function buildBriefCard(text) {
     }
   });
 
-  if (items.length > MAX_TAB_ITEMS) {
+  if (visible.length < items.length) {
     elements.push({ tag: "markdown", content: `…等共 ${items.length} 条` });
   }
 

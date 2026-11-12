@@ -23,9 +23,10 @@
 /** 平铺版式保持历史行为：最多 10 条，多出来的折叠成「…等共 N 条」。 */
 const MAX_FLAT_ITEMS = 10;
 /**
- * tab 版式单独放宽上限。一次日报经常同时有飞书、OA、EHR 三四十条，
- * 沿用平铺的 10 条会把排在最后的整个来源截没 —— 连 tab 条都会消失，
- * 用户只看到 summary 里那句「6 条 EHR 待审批」。
+ * tab 版式里**每个来源**的明细上限，不是整份信封的总上限。
+ * 一次日报常同时有飞书、OA、EHR 三四十条：早先 `items.slice(0, 30)`
+ * 会把排在最后的整个来源切没，卡片显示「EHR 0 条 / 未取到明细」，
+ * 而接口明明返回了 6 条。额度按来源分配，排第几都能拿到自己的那份。
  */
 const MAX_TAB_ITEMS = 30;
 const MARKERS = { now: "❗", today: "•", know: "·" };
@@ -200,8 +201,25 @@ function renderGrouped(items, spec) {
   return out;
 }
 
+/**
+ * 按来源分别限额：每个 section 独立计数，未标 section 的条目算一组。
+ * 保持原顺序，表格编号 / 分组 / 「审批第 N 条」的对应关系都不变。
+ */
+export function visibleTabItems(items, limit = MAX_TAB_ITEMS) {
+  const quota = new Map();
+  const visible = [];
+  for (const item of items) {
+    const key = item.section ?? "__unassigned__";
+    const used = quota.get(key) ?? 0;
+    if (used >= limit) continue;
+    quota.set(key, used + 1);
+    visible.push(item);
+  }
+  return visible;
+}
+
 function renderTabs(summary, items, specs) {
-  const visible = items.slice(0, MAX_TAB_ITEMS);
+  const visible = visibleTabItems(items);
   let out = summary;
   const unassigned = visible.filter((item) => !item.section);
   if (unassigned.length) {
@@ -229,7 +247,7 @@ function renderTabs(summary, items, specs) {
     });
   }
 
-  if (items.length > MAX_TAB_ITEMS) out += `\n\n…等共 ${items.length} 条`;
+  if (visible.length < items.length) out += `\n\n…等共 ${items.length} 条`;
   return out;
 }
 

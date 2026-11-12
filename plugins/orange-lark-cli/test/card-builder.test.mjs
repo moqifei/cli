@@ -19,9 +19,14 @@ import {
   buildStreamingCard,
   buildThinkingCard,
   cleanReasoningText,
+  extractThinkingContent,
   formatElapsed,
+  splitReasoningText,
+  stripThinkTags,
 } from "../src/card.mjs";
 import { describeTool, formatStepStatus } from "../src/tool-display.mjs";
+import { renderDeltaForUser, visibleTabItems } from "../src/render.mjs";
+import { buildBriefCard } from "../src/brief-card.mjs";
 
 const flatten = (node) => JSON.stringify(node);
 
@@ -98,7 +103,11 @@ test("complete card collapses panels, adds the elapsed reasoning label and the f
   assert.match(flat, /思考了 3\.2s/);
   assert.match(flat, /执行耗时 800\.0ms|执行耗时 0\.8s/);
   assert.match(flat, /本轮没有产生文本输出/, "an empty answer must still produce a message");
-  assert.equal(card.config.streaming_mode, undefined, "the final frame stops the animation");
+  assert.equal(
+    card.config.streaming_mode,
+    false,
+    "the final frame must explicitly stop streaming so the chat-list preview refreshes",
+  );
 
   for (const panel of card.body.elements.filter((element) => element.tag === "collapsible_panel")) {
     assert.equal(panel.expanded, false);
@@ -161,4 +170,96 @@ test("tool descriptors and durations match the old card vocabulary", () => {
   assert.equal(describeTool("mcp:grep").title, "Search text");
   assert.deepEqual(formatStepStatus("running"), { label: "Running", color: "turquoise" });
   assert.equal(formatElapsed(65_000), "1m 5s");
+});
+
+test("model think tags never leak into the answer or the chat-list summary", () => {
+  const raw = "清淡口的话，推荐广式早茶。\n</think>";
+  const final = buildCompleteCard({ text: raw, reasoningText: "想了想", reasoningExpanded: false });
+  const body = flatten(final);
+
+  assert.ok(!body.includes("</think>"), "the final card must not render a literal </think>");
+  assert.ok(!body.includes("<think>"), "the final card must not render a literal <think>");
+  assert.match(body, /清淡口的话/);
+  assert.ok(!final.config.summary.content.includes("think"), "the summary must be tag-free");
+  assert.equal(final.config.streaming_mode, false);
+
+  const streaming = buildStreamingCard({ answerText: "<think>internal</think>你好" });
+  assert.ok(!flatten(streaming).includes("think"), "streaming frames must strip think tags too");
+  assert.match(flatten(streaming), /你好/);
+
+  // 旧插件覆盖的变体：<thinking> / <thought> / <antthinking>、带空格标签、
+  // 未闭合标签、Reasoning: 前缀。
+  for (const tag of ["think", "thinking", "thought", "antthinking"]) {
+    assert.equal(stripThinkTags(`答案<${tag}>内部</${tag}>`), "答案", `${tag} block`);
+    assert.equal(stripThinkTags(`答案</${tag}>`), "答案", `orphan ${tag}`);
+    assert.equal(stripThinkTags(`答案< ${tag} >还在想`), "答案", `unclosed ${tag}`);
+  }
+  assert.equal(stripThinkTags("Reasoning:\n_想了想_\n"), "");
+  assert.equal(extractThinkingContent("答案<think>内部</think>"), "内部");
+  assert.deepEqual(splitReasoningText("<think>内部</think>答案"), {
+    reasoningText: "内部",
+    answerText: "答案",
+  });
+
+  // 空回答也必须有 summary，否则服务端保留建卡时的「处理中...」预览。
+  const empty = buildCompleteCard({ text: "</think>" });
+  assert.ok(empty.config.summary.content.length > 0, "empty answers still need a summary");
+  assert.ok(!empty.config.summary.content.includes("think"));
+});
+
+// 回归：39 条日报里 EHR 的 6 条排在 index 33–38。旧的全局 slice(0, 30)
+// 把整个来源切没，卡片显示「EHR · 待审批 0 条 / 本轮未取到该来源的明细」，
+// 但接口和模型信封里这 6 条都在。
+const THREE_SOURCE_ENVELOPE = JSON.stringify({
+  status: "delta",
+  summary: "飞书 3 件待跟进、OA 30 条待审批、EHR 6 条待审批",
+  sections: [
+    { name: "飞书", label: "飞书 · 消息与日程", hint: "群聊与例会" },
+    { name: "OA 待办", label: "OA · 待审批", hint: "待你处理的流程", headers: ["序号", "流程名称", "申请人"] },
+    { name: "EHR 待办", label: "EHR · 待审批", hint: "待你处理的人事流程", headers: ["序号", "流程名称", "申请人"] },
+  ],
+  items: [
+    ...Array.from({ length: 3 }, (_, i) => ({ title: `飞书消息 ${i}`, ref: `m${i}`, section: "飞书" })),
+    ...Array.from({ length: 30 }, (_, i) => ({
+      title: `OA 待办 ${i}`, ref: `o${i}`, section: "OA 待办", group: "部门收文",
+      cells: [i + 1, `OA流程 ${i}`, `OA申请人 ${i}`],
+    })),
+    ...Array.from({ length: 6 }, (_, i) => ({
+      title: `EHR 待办 ${i} 孙八`, ref: `e${i}`, section: "EHR 待办", group: "请假",
+      cells: [i + 1, `EHR流程 ${i}`, `EHR申请人 ${i}`],
+    })),
+  ],
+});
+
+test("排在最后的来源不会被全局条数上限整段截掉", () => {
+  const text = renderDeltaForUser(THREE_SOURCE_ENVELOPE);
+  assert.match(text, /TAB 3.*EHR · 待审批（6 条）/);
+  // 有 cells 的条目走表格行，纯文本里看不到 title，按行内容断言。
+  assert.match(text, /EHR申请人 5/);
+  assert.ok(!text.includes("本轮未取到该来源的明细"), "取到了数据就不能报缺明细");
+
+  const card = buildBriefCard(THREE_SOURCE_ENVELOPE);
+  assert.ok(card);
+  const serialized = flatten(card);
+  assert.match(serialized, /\*\*EHR\*\*.*\*\*6 条\*\*/, "速览里 EHR 要数出 6 条");
+  assert.match(serialized, /EHR · 待审批.*6 条/, "分区标题也要数出 6 条");
+  assert.match(serialized, /EHR申请人 5/, "EHR 表格行要真的渲染出来");
+  assert.ok(!serialized.includes("本轮未取到该来源的明细"));
+});
+
+test("按来源限额仍然生效，超出的条目折叠而不是无限铺开", () => {
+  const items = Array.from({ length: 35 }, (_, i) => ({
+    title: `事项 ${i}`, ref: `o${i}`, section: "OA", group: "G",
+    cells: [i + 1, `流程 ${i}`, "张三"],
+  }));
+  assert.equal(visibleTabItems(items.map((item) => ({ ...item, section: null })), 30).length, 30);
+  const envelope = JSON.stringify({
+    status: "delta",
+    sections: [{ name: "OA", label: "OA · 待审批" }],
+    items,
+  });
+  const text = renderDeltaForUser(envelope);
+  assert.match(text, /…等共 35 条/);
+  assert.ok(!text.includes("流程 34"), "单来源超过 30 条要折叠");
+  assert.match(flatten(buildBriefCard(envelope)), /…等共 35 条/);
 });
