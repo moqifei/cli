@@ -20,9 +20,13 @@ const fakeCli = path.join(here, "fake-lark-cli.mjs");
 
 // owner 隔离后授权门要求显式 resolver，否则所有发卡路径都会 fail-close，
 // device flow 根本起不来。测试里统一把调用方给的 account 钉上 owner。
-const { setOwnerAccountResolver, classifyScopeGap, shouldInjectResume } = await import(
-  "../src/auth-gate.mjs"
-);
+const {
+  setOwnerAccountResolver,
+  classifyScopeGap,
+  shouldInjectResume,
+  shouldRetryProactiveRerun,
+  RERUN_MAX_ATTEMPTS,
+} = await import("../src/auth-gate.mjs");
 setOwnerAccountResolver((ownerId, fallback) =>
   fallback ? { ...fallback, ownerUserId: ownerId } : null,
 );
@@ -44,6 +48,22 @@ test("authorization completion keeps exactly one execution chain", () => {
     shouldInjectResume({ rerunJobs: 0, originTask: "同意，顺便把昨天的会议纪要整理一下" }),
     true,
   );
+});
+
+test("authorization rerun keeps waiting while the previous daily brief is still running", () => {
+  // 2026-11-13 13:49：用户在 run 进行中点完授权，插件立刻 POST /run，
+  // 网关把 "job already running" 映射成 404。旧实现重试 3 次共 30 秒就放弃，
+  // 而那轮日报还要跑 85 秒，于是自动补跑彻底丢失。
+  assert.equal(shouldRetryProactiveRerun(404, 1), true, "404 可能是 job already running");
+  assert.equal(shouldRetryProactiveRerun(409, 1), true);
+  assert.equal(shouldRetryProactiveRerun(503, 1), true, "网关重启也要等");
+  assert.equal(shouldRetryProactiveRerun(404, RERUN_MAX_ATTEMPTS - 1), true);
+
+  // 真错误不重试，窗口也有上限，避免无限打点。
+  assert.equal(shouldRetryProactiveRerun(401, 1), false);
+  assert.equal(shouldRetryProactiveRerun(400, 1), false);
+  assert.equal(shouldRetryProactiveRerun(404, RERUN_MAX_ATTEMPTS), false);
+  assert.ok(RERUN_MAX_ATTEMPTS >= 24, "重试窗口必须能覆盖一次 2–6 分钟的日报");
 });
 
 test("declared mode separates undeclared scope gaps from real consent gaps", () => {

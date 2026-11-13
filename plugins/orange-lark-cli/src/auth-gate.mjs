@@ -990,17 +990,37 @@ function gatewayPort() {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// 授权完成后，触发这次授权的那轮日报往往还在跑（一次 2–6 分钟）。网关的
+// `/api/v1/cron/jobs/:id/run` 把 scheduler 返回的**所有** Err 都映射成 404，
+// 其中就包括 "job already running"（见 gateway/api.rs::run_cron_job）。所以
+// 404 不能当成「作业不存在」直接放弃，必须等到当前 run 结束；旧实现只重试
+// 3 次 ×10s，会在 run 结束前耗尽，用户只看到失败提示、收不到补跑的日报。
+export const RERUN_MAX_ATTEMPTS = 36; // 10s × 36 = 6min，覆盖一次完整日报
+const RERUN_RETRY_MS = 10_000;
+
+/**
+ * POST /run 失败后还要不要继续等。404/409 代表「上一轮还没结束」或临时冲突，
+ * 5xx 多半是网关重启；其余 4xx（参数 / 鉴权错）重试也没有意义。
+ * 抽成纯函数便于回归测试，不依赖真实网关。
+ */
+export function shouldRetryProactiveRerun(status, attempt, maxAttempts = RERUN_MAX_ATTEMPTS) {
+  if (attempt >= maxAttempts) return false;
+  return status === 404 || status === 409 || status >= 500;
+}
+
 async function waitUntilJobIdle(port, jobId, { timeoutMs = 6 * 60_000 } = {}) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
       const res = await fetch(`http://127.0.0.1:${port}/api/v1/cron/jobs/${jobId}/runs`);
-      if (!res.ok) return;
-      const data = await res.json();
-      const runs = Array.isArray(data.runs) ? data.runs : [];
-      if (!runs.some((run) => !run.finished_at)) return;
+      if (res.ok) {
+        const data = await res.json();
+        const runs = Array.isArray(data.runs) ? data.runs : [];
+        if (!runs.some((run) => !run.finished_at)) return;
+      }
+      // 探测失败（网关重启 / 端口未就绪）不等于空闲，继续等。
     } catch {
-      return;
+      // 网络抖动同理，不该让补跑窗口提前关闭。
     }
     await sleep(5_000);
   }
@@ -1067,26 +1087,38 @@ function triggerProactiveRerun(log, ownerId) {
   const port = gatewayPort();
   for (const jobId of jobIds) {
     void (async () => {
+      const shortId = String(jobId).slice(0, 8);
+      // run log 只在 run 结束时落盘，这里通常看不到「进行中」；真正的等待由
+      // 下面对 404(=job already running) 的重试完成。
       await waitUntilJobIdle(port, jobId);
-      for (let attempt = 1; attempt <= 3; attempt += 1) {
+      for (let attempt = 1; attempt <= RERUN_MAX_ATTEMPTS; attempt += 1) {
         try {
           const res = await fetch(`http://127.0.0.1:${port}/api/v1/cron/jobs/${jobId}/run`, {
             method: "POST",
           });
           if (res.ok) {
-            log.info(`re-ran proactive job ${String(jobId).slice(0, 8)} after authorization`);
+            log.info(`re-ran proactive job ${shortId} after authorization (attempt ${attempt})`);
             return;
           }
-          log.warn(`proactive rerun responded ${res.status} for ${String(jobId).slice(0, 8)}`);
+          const body = await res.text().catch(() => "");
+          const retry = shouldRetryProactiveRerun(res.status, attempt);
+          log.warn(
+            `proactive rerun responded ${res.status} for ${shortId} ` +
+              `(attempt ${attempt}/${RERUN_MAX_ATTEMPTS}${retry ? ", waiting for the active run" : ", giving up"}): ` +
+              `${body.slice(0, 160)}`,
+          );
+          if (!retry) return;
         } catch (error) {
           log.warn(
-            `proactive rerun failed (attempt ${attempt}) for ${String(jobId).slice(0, 8)}: ${
+            `proactive rerun failed (attempt ${attempt}/${RERUN_MAX_ATTEMPTS}) for ${shortId}: ${
               error?.message ?? error
             }`,
           );
+          if (attempt >= RERUN_MAX_ATTEMPTS) return;
         }
-        await sleep(10_000);
+        await sleep(RERUN_RETRY_MS);
       }
+      log.warn(`proactive rerun gave up for ${shortId} after ${RERUN_MAX_ATTEMPTS} attempts`);
     })();
   }
   return jobIds.length;
