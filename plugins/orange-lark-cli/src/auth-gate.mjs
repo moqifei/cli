@@ -990,12 +990,13 @@ function gatewayPort() {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// 授权完成后，触发这次授权的那轮日报往往还在跑（一次 2–6 分钟）。网关的
+// 授权完成时，触发这次授权的那轮日报往往还在跑（一次 2–6 分钟）。网关的
 // `/api/v1/cron/jobs/:id/run` 把 scheduler 返回的**所有** Err 都映射成 404，
-// 其中就包括 "job already running"（见 gateway/api.rs::run_cron_job）。所以
-// 404 不能当成「作业不存在」直接放弃，必须等到当前 run 结束；旧实现只重试
-// 3 次 ×10s，会在 run 结束前耗尽，用户只看到失败提示、收不到补跑的日报。
-export const RERUN_MAX_ATTEMPTS = 36; // 10s × 36 = 6min，覆盖一次完整日报
+// 其中就包括 "job already running"（见 gateway/api.rs::run_cron_job），所以不能
+// 一授权完就盲目 POST。但等它跑完也不能无条件补跑：那轮日报可能已经正常投递
+// 了（14:16 那次就是首跑 14:16:17 已出卡片，补跑又在 14:20:09 出了第二张）。
+// 补跑只应发生在那轮因为「未授权」而没投递成功的时候。
+export const RERUN_MAX_ATTEMPTS = 60; // 10s × 60 = 10min，覆盖两轮补跑
 const RERUN_RETRY_MS = 10_000;
 
 /**
@@ -1008,21 +1009,54 @@ export function shouldRetryProactiveRerun(status, attempt, maxAttempts = RERUN_M
   return status === 404 || status === 409 || status >= 500;
 }
 
-async function waitUntilJobIdle(port, jobId, { timeoutMs = 6 * 60_000 } = {}) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/api/v1/cron/jobs/${jobId}/runs`);
-      if (res.ok) {
-        const data = await res.json();
-        const runs = Array.isArray(data.runs) ? data.runs : [];
-        if (!runs.some((run) => !run.finished_at)) return;
-      }
-      // 探测失败（网关重启 / 端口未就绪）不等于空闲，继续等。
-    } catch {
-      // 网络抖动同理，不该让补跑窗口提前关闭。
-    }
-    await sleep(5_000);
+/** 最多补跑两轮：模型偶发跑偏时给两次自愈机会，又不会无限重试。 */
+export const MAX_PROACTIVE_RERUNS = 2;
+
+/**
+ * 取「在 afterMs 之后才结束」的最新一轮 run。run log 只在 run 结束时落盘，
+ * 查不到就说明它还在跑（或网关暂时不可达），返回 null 让调用方继续等。
+ */
+export function latestCompletedRun(runs, afterMs = 0) {
+  if (!Array.isArray(runs)) return null;
+  const parseTime = (value) => (typeof value === "string" ? Date.parse(value) : NaN);
+  return (
+    runs
+      .filter((run) => {
+        const finished = parseTime(run?.finished_at);
+        return Number.isFinite(finished) && finished > afterMs;
+      })
+      .sort((a, b) => parseTime(b.finished_at) - parseTime(a.finished_at))[0] ?? null
+  );
+}
+
+/** 「触发这次授权的那轮」有没有投递成功（保留旧口径）。 */
+export function authorizationRunOutcome(runs, authorizedAt, toleranceMs = 5_000) {
+  const latest = latestCompletedRun(runs, authorizedAt - toleranceMs);
+  if (!latest) return null;
+  return {
+    delivered: latest.delivered === true,
+    deliveryStatus: latest.delivery_status ?? null,
+  };
+}
+
+/**
+ * 看到一轮结果后下一步怎么走。每轮都以 `delivered` 为准：成功立刻收手，
+ * 绝不重复投递；连续失败超过上限才放弃。
+ */
+export function rerunDecision(run, reruns, maxReruns = MAX_PROACTIVE_RERUNS) {
+  if (!run) return "wait";
+  if (run.delivered === true) return "skip";
+  return reruns < maxReruns ? "rerun" : "giveup";
+}
+
+async function fetchJobRuns(port, jobId) {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/api/v1/cron/jobs/${jobId}/runs`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    return Array.isArray(data?.runs) ? data.runs : null;
+  } catch {
+    return null;
   }
 }
 
@@ -1046,11 +1080,12 @@ export function shouldInjectResume({ rerunJobs = 0, originTask = "" } = {}) {
 }
 
 /**
- * 授权完成后重跑触发它的主动任务。
+ * 授权完成后，视情况重跑触发它的主动任务。
  *
  * 否则定时轮因为「数据源未授权」产出 NO_UPDATES，调度器判定无增量不投递，
- * 用户授权完就再也听不到消息了。返回拉起的作业数，调用方据此决定是否还要
- * 注入合成 resume（见 shouldInjectResume）。
+ * 用户授权完就再也听不到消息了。但如果那轮已经正常投递了日报，就绝不能补跑
+ * ——否则用户会在几分钟内收到两份日报。返回值是登记了补跑意图的作业数，
+ * 调用方据此决定是否还要注入合成 resume（见 shouldInjectResume）。
  */
 function triggerProactiveRerun(log, ownerId) {
   // 只重跑**刚完成授权的那个人**的作业。旧实现把台账里所有 active job 一起
@@ -1085,29 +1120,50 @@ function triggerProactiveRerun(log, ownerId) {
   log.info(`proactive rerun: ${jobIds.length} job(s) owned by ${owner}`);
 
   const port = gatewayPort();
+  const authorizedAt = Date.now();
   for (const jobId of jobIds) {
     void (async () => {
       const shortId = String(jobId).slice(0, 8);
-      // run log 只在 run 结束时落盘，这里通常看不到「进行中」；真正的等待由
-      // 下面对 404(=job already running) 的重试完成。
-      await waitUntilJobIdle(port, jobId);
+      // 只看授权完成之后结束的 run；每轮推进游标，避免重复盯着同一条记录。
+      let afterMs = authorizedAt - 5_000;
+      let reruns = 0;
       for (let attempt = 1; attempt <= RERUN_MAX_ATTEMPTS; attempt += 1) {
+        const run = latestCompletedRun(await fetchJobRuns(port, jobId), afterMs);
+        const decision = rerunDecision(run, reruns);
+        if (decision === "skip") {
+          log.info(`skipping proactive rerun for ${shortId}: a brief was already delivered`);
+          return;
+        }
+        if (decision === "giveup") {
+          log.warn(`proactive rerun gave up for ${shortId} after ${reruns} rerun(s)`);
+          return;
+        }
+        if (decision === "wait") {
+          // 当前轮还没落盘（仍在跑）或网关暂时不可达，别急着 POST。
+          await sleep(RERUN_RETRY_MS);
+          continue;
+        }
+        // decision === "rerun"：这轮没投递，补一次，然后继续观察补跑结果。
         try {
           const res = await fetch(`http://127.0.0.1:${port}/api/v1/cron/jobs/${jobId}/run`, {
             method: "POST",
           });
           if (res.ok) {
-            log.info(`re-ran proactive job ${shortId} after authorization (attempt ${attempt})`);
-            return;
+            reruns += 1;
+            afterMs = Date.parse(run.finished_at);
+            log.info(
+              `re-ran proactive job ${shortId} after authorization (${reruns}/${MAX_PROACTIVE_RERUNS})`,
+            );
+          } else {
+            const body = await res.text().catch(() => "");
+            const retry = shouldRetryProactiveRerun(res.status, attempt);
+            log.warn(
+              `proactive rerun responded ${res.status} for ${shortId} ` +
+                `(attempt ${attempt}/${RERUN_MAX_ATTEMPTS}${retry ? ", waiting for the active run" : ", giving up"}): ` +
+                `${body.slice(0, 160)}`,
+            );
+            if (!retry) return;
           }
-          const body = await res.text().catch(() => "");
-          const retry = shouldRetryProactiveRerun(res.status, attempt);
-          log.warn(
-            `proactive rerun responded ${res.status} for ${shortId} ` +
-              `(attempt ${attempt}/${RERUN_MAX_ATTEMPTS}${retry ? ", waiting for the active run" : ", giving up"}): ` +
-              `${body.slice(0, 160)}`,
-          );
-          if (!retry) return;
         } catch (error) {
           log.warn(
             `proactive rerun failed (attempt ${attempt}/${RERUN_MAX_ATTEMPTS}) for ${shortId}: ${

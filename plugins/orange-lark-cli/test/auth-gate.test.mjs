@@ -25,6 +25,10 @@ const {
   classifyScopeGap,
   shouldInjectResume,
   shouldRetryProactiveRerun,
+  authorizationRunOutcome,
+  latestCompletedRun,
+  rerunDecision,
+  MAX_PROACTIVE_RERUNS,
   RERUN_MAX_ATTEMPTS,
 } = await import("../src/auth-gate.mjs");
 setOwnerAccountResolver((ownerId, fallback) =>
@@ -64,6 +68,77 @@ test("authorization rerun keeps waiting while the previous daily brief is still 
   assert.equal(shouldRetryProactiveRerun(400, 1), false);
   assert.equal(shouldRetryProactiveRerun(404, RERUN_MAX_ATTEMPTS), false);
   assert.ok(RERUN_MAX_ATTEMPTS >= 24, "重试窗口必须能覆盖一次 2–6 分钟的日报");
+});
+
+test("authorization rerun is skipped when the authorizing run already delivered a brief", () => {
+  // 2026-11-13 14:16：首跑 14:16:17 已投递日报，授权后补跑又在 14:20:09
+  // 投了第二份。补跑必须先确认「触发授权的那轮」有没有投递成功。
+  const authorizedAt = Date.parse("2026-11-13T14:15:58+08:00");
+  const authorizingRun = {
+    started_at: "2026-11-13T14:14:37+08:00",
+    finished_at: "2026-11-13T14:16:17+08:00",
+    delivered: true,
+    delivery_status: "delivered",
+  };
+
+  assert.deepEqual(authorizationRunOutcome([authorizingRun], authorizedAt), {
+    delivered: true,
+    deliveryStatus: "delivered",
+  });
+
+  // 同一轮但没投递（守卫拦下 / NO_UPDATES）→ 这才需要补跑。
+  assert.equal(
+    authorizationRunOutcome(
+      [{ ...authorizingRun, delivered: false, delivery_status: "failure-notice" }],
+      authorizedAt,
+    ).delivered,
+    false,
+  );
+
+  // 授权完成前就结束的旧日报不能拿来判定，否则会误跳过补跑。
+  const olderRun = {
+    started_at: "2026-11-13T13:59:38+08:00",
+    finished_at: "2026-11-13T14:00:58+08:00",
+    delivered: true,
+  };
+  assert.equal(authorizationRunOutcome([olderRun], authorizedAt), null);
+
+  // 仍在跑（无 finished_at）/ 空 / 非法输入 → 继续等，不 POST。
+  assert.equal(
+    authorizationRunOutcome([{ ...authorizingRun, finished_at: null }], authorizedAt),
+    null,
+  );
+  assert.equal(authorizationRunOutcome([], authorizedAt), null);
+  assert.equal(authorizationRunOutcome(null, authorizedAt), null);
+});
+
+test("authorization rerun retries at most twice and stops as soon as a brief is delivered", () => {
+  // 2026-11-13 14:38–14:45：首跑被 length 截断，自动补跑又只吐了一句英文旁白，
+  // 两轮都 failure-notice，旧实现补一次就收手，用户一份日报都没收到。
+  const failed = {
+    started_at: "2026-11-13T14:38:42+08:00",
+    finished_at: "2026-11-13T14:43:10+08:00",
+    delivered: false,
+    delivery_status: "failure-notice",
+  };
+  const retryFailed = {
+    started_at: "2026-11-13T14:43:20+08:00",
+    finished_at: "2026-11-13T14:45:15+08:00",
+    delivered: false,
+    delivery_status: "failure-notice",
+  };
+  const retryDelivered = { ...retryFailed, delivered: true, delivery_status: "delivered" };
+  const cursor = Date.parse(failed.finished_at);
+
+  assert.equal(latestCompletedRun([failed], cursor), null, "游标之后的 run 才看");
+  assert.equal(latestCompletedRun([failed, retryFailed], cursor)?.delivered, false);
+
+  assert.equal(rerunDecision(null, 0), "wait");
+  assert.equal(rerunDecision(failed, 0), "rerun");
+  assert.equal(rerunDecision(retryFailed, 1), "rerun");
+  assert.equal(rerunDecision(retryFailed, MAX_PROACTIVE_RERUNS), "giveup");
+  assert.equal(rerunDecision(retryDelivered, 1), "skip", "补跑成功后立即收手，不重复投递");
+  assert.ok(RERUN_MAX_ATTEMPTS * 10 >= 480, "观察窗口要覆盖两轮日报");
 });
 
 test("declared mode separates undeclared scope gaps from real consent gaps", () => {
