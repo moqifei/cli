@@ -1667,6 +1667,19 @@ function scheduleAuthorizationCompletion({ account, flow, chat, log }) {
     if (flow.grantSignature) {
       writeGrantMarker(account, flow.grantSignature, flow.scopes?.length ?? 0, log);
     }
+    // 宿主（Orange）的首跑闸门只读 `auth-state.json` 判断「这个人授权了没有」。
+    // 上面那句 `invalidateAuthStatus()` 只是删掉内存缓存，**没有重写文件**，
+    // 于是文件会一直停在授权前的 `user_ready: false`：2026-11-16 线上就是
+    // 用户 09:58:17 点完卡片、标记也写了，状态文件还写着 09:57:57 的 missing，
+    // 首跑永远不触发，机器人一句话都没有。
+    // 这里补一次强制校验：`readAuthStatus({force:true})` 用 `--verify` 问服务端，
+    // 并把真实结果写回状态文件。失败也不影响授权结论：标记已经落盘，宿主侧
+    // 还有一条兜底。
+    try {
+      await readAuthStatus(account, { force: true, log, ownerUserId: flow.ownerUserId });
+    } catch (error) {
+      log.warn(`auth state refresh after authorization failed: ${error?.message ?? error}`);
+    }
     // 旧快照里还是授权前的 scope 列表，留着会让下一次判断用过期数据。
     verifiedAuthByAccount.delete(accountChatKey(account));
     log.info("user identity authorized via device flow");
