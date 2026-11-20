@@ -17,7 +17,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { registerHttpTokenInjector } from "../src/http-token-injector.mjs";
+import { prefetchInboundIdentity, registerHttpTokenInjector } from "../src/http-token-injector.mjs";
 
 const OPEN_ID = "ou_test";
 
@@ -39,7 +39,7 @@ function makeLogger() {
 }
 
 /** 收集一个注入器实例注册的钩子，并返回可调用的 handler。 */
-function mount({ runCli, fetchImpl, pluginConfig = {}, isScopeFailure, configDir } = {}) {
+function mount({ runCli, fetchImpl, pluginConfig = {}, isScopeFailure, configDir, accounts } = {}) {
   let handler = null;
   const api = {
     pluginConfig: {
@@ -58,11 +58,13 @@ function mount({ runCli, fetchImpl, pluginConfig = {}, isScopeFailure, configDir
   // 每个用例一个独立目录：身份会落盘，共用目录会让"第二次调用不再 spawn"
   // 变成隐式行为，测试之间互相污染。
   const dir = configDir ?? mkdtempSync(path.join(os.tmpdir(), "token-injector-"));
-  const accounts = [{ accountId: "work", cliPath: "lark-cli", configDir: dir, scratchDir: "/tmp", env: {} }];
+  const resolvedAccounts = accounts ?? [
+    { accountId: "work", cliPath: "lark-cli", configDir: dir, scratchDir: "/tmp", env: {} },
+  ];
 
   registerHttpTokenInjector({
     api,
-    getAccounts: () => accounts,
+    getAccounts: () => resolvedAccounts,
     runCli: runCli ?? (async () => ({ ok: true, data: {} })),
     logger,
     isScopeFailure: isScopeFailure ?? ((error) => error?.scope === true),
@@ -281,4 +283,71 @@ test("shell 在非 feishu 渠道不注入", async () => {
     payload({ tool_name: "shell", channel: "openim", params: { command: "date" } }),
   );
   assert.equal(result.action, "continue");
+});
+
+test("入站预取写入缓存后，hook 不再重复查通讯录", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "token-injector-prefetch-"));
+  const account = { accountId: "bot-a", cliPath: "lark-cli", configDir: dir, scratchDir: "/tmp", env: {} };
+  const openId = "ou_prefetchhit";
+  const prefetched = await prefetchInboundIdentity({
+    account,
+    openId,
+    runCli: async () => ({
+      ok: true,
+      data: { user: { name: "预取用户", enterprise_email: "prefetched@corp.com" } },
+    }),
+    log: makeLogger(),
+  });
+  assert.equal(prefetched.email, "prefetched@corp.com");
+
+  let cliCalls = 0;
+  const { handler } = mount({
+    accounts: [account],
+    runCli: async () => {
+      cliCalls += 1;
+      throw new Error("prefetch 已命中，不应再查通讯录");
+    },
+    fetchImpl: okToken(),
+  });
+
+  const result = await handler(payload({ user_id: openId, account_id: "bot-a" }));
+  assert.equal(cliCalls, 0);
+  assert.equal(result.action, "modify");
+  assert.equal(result.payload.params.headers.username, "prefetched");
+});
+
+test("同一用户切换机器人不会复用另一个账号的缓存身份", async () => {
+  const dirA = mkdtempSync(path.join(os.tmpdir(), "token-injector-a-"));
+  const dirB = mkdtempSync(path.join(os.tmpdir(), "token-injector-b-"));
+  const accountA = { accountId: "bot-a", cliPath: "lark-cli", configDir: dirA, scratchDir: "/tmp", env: {} };
+  const accountB = { accountId: "bot-b", cliPath: "lark-cli", configDir: dirB, scratchDir: "/tmp", env: {} };
+  const openId = "ou_prefetchisolated";
+
+  await prefetchInboundIdentity({
+    account: accountA,
+    openId,
+    runCli: async () => ({
+      ok: true,
+      data: { user: { name: "A用户", enterprise_email: "from-a@corp.com" } },
+    }),
+    log: makeLogger(),
+  });
+
+  const calls = [];
+  const { handler } = mount({
+    accounts: [accountB],
+    runCli: async ({ args }) => {
+      calls.push(args.join(" "));
+      if (args[1] === "+get-user") {
+        return { ok: true, data: { user: { name: "B用户", enterprise_email: "from-b@corp.com" } } };
+      }
+      throw new Error("user 身份不该被调用");
+    },
+    fetchImpl: okToken(),
+  });
+
+  const result = await handler(payload({ user_id: openId, account_id: "bot-b" }));
+  assert.equal(result.action, "modify");
+  assert.equal(result.payload.params.headers.username, "from-b", "必须使用当前机器人账号解析出的身份");
+  assert.ok(calls[0].includes("--as bot"));
 });

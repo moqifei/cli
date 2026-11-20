@@ -57,7 +57,7 @@ import {
 import { buildBriefCard } from "./brief-card.mjs";
 import { splitReasoningText } from "./card.mjs";
 import { looksLikeEnvelope, renderDeltaForUser } from "./render.mjs";
-import { registerHttpTokenInjector } from "./http-token-injector.mjs";
+import { prefetchInboundIdentity, registerHttpTokenInjector } from "./http-token-injector.mjs";
 import { createUserTools } from "./user-tools.mjs";
 import { blocksToPlainText, sendCard, sendPost, sendTextChunked } from "./outbound.mjs";
 import { StreamingReply } from "./streaming.mjs";
@@ -66,6 +66,22 @@ const DEFAULT_EVENT_KEY = "im.message.receive_v1";
 const DEFAULT_IDENTITY = "bot";
 const DEFAULT_READY_TIMEOUT_MS = 30_000;
 const RESTART_BACKOFF_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
+const INBOUND_IDENTITY_WAIT_MS = 1_200;
+
+function settlePromise(promise, timeoutMs, fallback) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(fallback), timeoutMs);
+    timer.unref?.();
+    Promise.resolve(promise).then(finish, () => finish(fallback));
+  });
+}
 
 function orangeHome() {
   return process.env.ORANGE_HOME && process.env.ORANGE_HOME.trim()
@@ -648,9 +664,25 @@ class AccountRuntime {
     }
 
     const chatKey = mapped.context.ChatId ?? mapped.context.SenderId ?? messageId;
-    this.enqueue(chatKey, () =>
-      this.limit(() => this.dispatchInbound(mapped.context)),
-    ).catch((error) => {
+    // 用户主动消息：用“收到这条消息的机器人账号”预取 sender 身份，写进按
+    // accountId 隔离的缓存，并把 SenderUsername 交给 Orange。cron / 被动触发
+    // 没有入站事件，不会走这里，仍由 before_tool_call 的 lazy 查询兜底。
+    const senderId = mapped.context.SenderId;
+    const identityReady = senderId
+      ? prefetchInboundIdentity({
+          account: this.account,
+          openId: senderId,
+          runCli,
+          log: this.log,
+        })
+      : Promise.resolve(null);
+
+    this.enqueue(chatKey, async () => {
+      const identity = await settlePromise(identityReady, INBOUND_IDENTITY_WAIT_MS, null);
+      const username = identity?.email?.split("@")[0]?.trim();
+      if (username) mapped.context.SenderUsername = username;
+      return this.limit(() => this.dispatchInbound(mapped.context));
+    }).catch((error) => {
       this.log.error(`dispatch failed for ${messageId}: ${error?.message ?? error}`);
     });
   }
@@ -976,11 +1008,15 @@ function configUserOpenIds(configDir) {
  * - 否则就地建 `data/lark-cli/<open_id>/`，只复制应用凭证、users 留空，
  *   由这个人自己点授权。绝不把别人的 user token 借给他。
  *
+ * `templateAccountId` 用来选择复制哪份应用凭证：调用方应传当前机器人账号，
+ * 不能永远用 accounts[0]，多机器人环境下那会把 A 应用的权限借给 B。
+ *
  * `runtimeAccountId` 指回渠道账号：resume / 会话记忆都注册在它下面。
  */
-export function resolveAccountForOwner(ownerId, accounts, { log } = {}) {
+export function resolveAccountForOwner(ownerId, accounts, { log, templateAccountId } = {}) {
   const owner = normalizeOwnerId(ownerId);
-  const template = accounts?.[0];
+  const template =
+    accounts.find((entry) => entry.accountId === templateAccountId) ?? accounts?.[0];
   if (!owner || !template) return null;
 
   const declared = accounts.find((entry) => entry.accountId === owner);
@@ -1421,8 +1457,8 @@ export default {
 
     // 所有需要「以用户本人身份」的路径都经过这里：lark_cli、通讯录工具、
     // 网关凭据注入器、以及 after_tool_call 授权钩子。
-    const resolveOwnerAccount = (ownerId) =>
-      resolveAccountForOwner(ownerId, getAccounts(), { log: logger });
+    const resolveOwnerAccount = (ownerId, templateAccountId) =>
+      resolveAccountForOwner(ownerId, getAccounts(), { log: logger, templateAccountId });
 
     const plugin = createChannelPlugin({ api, pluginConfig, logger, resolveAccounts: getAccounts });
     api.registerChannel({ plugin });
