@@ -20,6 +20,7 @@
 | `src/tool-display.mjs` | 工具步骤展示 | 工具名 → 图标 + 标题；Running/Succeeded 状态色 |
 | `src/streaming.mjs` | 流式卡片生命周期 | 首帧立刻建卡并**回复**用户消息；节流 + 串行更新；终帧收尾 |
 | `src/auth-gate.mjs` | 授权门 + `after_tool_call` 钩子 | 缺权限 → 当前会话发卡片 → 授权后同 session 续跑；与具体工具解耦 |
+| `src/collaboration-cards.mjs` | 协作审批卡状态映射 | 按 approval ID 定位已有 CardKit 卡，持久化更新意图/sequence，原位更新终态并支持重复控制消息 |
 | `src/proxy.mjs` | 企业网络代理 | 解析 `proxy:` 配置 → lark-cli 子进程 env（含 TLS 中间人 CA）；loopback 永久直连 |
 | `src/log.mjs` | 日志 | 统一前缀 + 凭证脱敏 |
 | `build.mjs` | 构建 | 仅复制 `src/*.mjs` 到 `dist/` |
@@ -46,6 +47,7 @@ api.registerChannel({
 - `setup.resolveAccounts` 优先于 `config.listAccountIds`，返回的对象会作为 `ctx.account` 传给 `startAccount`；
 - `gateway.startAccount` **不被 await**（`bridge-harness.ts:350-358` 立即返回），所以启动失败只能在插件内打日志 + 自愈，不能靠抛错让 `channel/connect` 失败；
 - `outbound.sendText` 同时被入站回复和宿主主动推送（cron）复用。
+- `blocks.orange_collaboration_approval_update` 是宿主控制事件，必须先于通用 `blocks`/空文本处理；卡片更新成功才返回成功，不能降级成新消息或把失败吞掉。
 
 ### 2.2 入站上下文字段
 
@@ -60,6 +62,7 @@ api.registerChannel({
 | 去重/追踪 | `MessageSid` | `message_id` |
 | 线程 | `MessageThreadId` | `thread_id` |
 | 群 @ 门禁 | `WasMentioned` | `mentions` 推导（p2p 不校验） |
+| 协作入口精确 @ | `BotWasMentioned` | 仅当 `mentions[]` 中的 `id` 匹配当前机器人的 `botOpenId` 时为 true；`@all` 不算 |
 | 路由 | `AgentId` / `SessionKey` | `runtime.channel.routing.resolveAgentRoute()` |
 
 实测宿主生成的 session key：`main:feishu:test:direct:ou_p0_test_user`，说明 `account_id` + peer 都正确传入。

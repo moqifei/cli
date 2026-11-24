@@ -56,6 +56,7 @@ export class StreamingReply {
     this.sequence = 0;
     this.failed = false;
     this.closed = false;
+    this.warmupSuppressed = false;
     // 终态闸门：finish() 一进入就置位，阻止迟到的 flush 把终帧覆盖成流式态。
     this.finalizing = false;
     this.streamingClosed = false;
@@ -125,12 +126,13 @@ export class StreamingReply {
     // 并发调用共享同一个 promise，避免建卡 / 发消息被重复执行。
     if (this.startPromise) return this.startPromise;
     if (this.cardId) return this.cardId;
-    if (this.failed || this.closed) return null;
+    if (this.failed || this.closed || this.warmupSuppressed) return null;
 
     this.startPromise = (async () => {
       try {
         const card = buildThinkingCard({ loadingIcon: this.loadingIcon });
         const cardId = await createCard(this.account, card, { log: this.log });
+        if (this.warmupSuppressed) return null;
         await sendCard({
           cliPath: this.account.cliPath,
           configDir: this.account.configDir,
@@ -162,6 +164,10 @@ export class StreamingReply {
     })();
 
     return this.startPromise;
+  }
+
+  suppressWarmup() {
+    if (!this.cardId) this.warmupSuppressed = true;
   }
 
   onReasoning(text) {

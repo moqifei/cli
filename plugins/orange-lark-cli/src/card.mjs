@@ -417,3 +417,32 @@ export function buildCompleteCard({
     body: { elements },
   };
 }
+
+export function buildCollaborationApprovalCard(approval, state = "pending") {
+  const labels = {
+    pending: ["审批请求", "待处理", "blue"],
+    approved: ["审批已批准", "已批准一次", "green"],
+    denied: ["审批已拒绝", "已拒绝", "grey"],
+    expired: ["审批已过期", "已过期", "grey"],
+    interrupted: ["执行已中断", "已中断", "grey"],
+    cancelled: ["任务已结束", "已失效", "grey"],
+  }[state];
+  if (!labels) throw new Error(`unsupported collaboration approval state: ${state}`);
+  const elements = [
+    { tag: "markdown", content: `**任务 ID**：\`${String(approval.task_id ?? "未知")}\`` },
+    { tag: "markdown", content: `**发起人**：${approval.requester_name || approval.requester_id || "未知用户"}` },
+    { tag: "markdown", content: `**待执行操作**：\`${approval.tool_name || "工具操作"}\`` },
+    { tag: "markdown", content: `**参数摘要**：\n\`\`\`json\n${String(approval.arguments ?? "{}").slice(0, 1800)}\n\`\`\`` },
+    { tag: "markdown", content: `有效期至：${new Date(Number(approval.expires_at_ms) || Date.now()).toLocaleString("zh-CN")}` },
+  ];
+  return {
+    schema: "2.0",
+    config: { wide_screen_mode: true, update_multi: true },
+    header: {
+      title: { tag: "plain_text", content: labels[0] },
+      template: labels[2],
+      text_tag_list: [{ tag: "text_tag", text: { tag: "plain_text", content: labels[1] } }],
+    },
+    body: { elements },
+  };
+}

@@ -36,8 +36,11 @@ export function mapMessageEvent(event, options) {
   const chatType = event.chat_type === "p2p" ? "direct" : "group";
   const isGroup = chatType === "group";
   const mentions = Array.isArray(event.mentions) ? event.mentions : [];
+  const botWasMentioned = Boolean(
+    botOpenId && mentions.some((mention) => mention?.id === botOpenId),
+  );
   const mentioned =
-    mentions.some((mention) => mention?.id && botOpenId && mention.id === botOpenId) ||
+    botWasMentioned ||
     mentions.some((mention) => mention?.id === "all" || mention?.key === "@_all") ||
     (mentions.length > 0 && !botOpenId);
 
@@ -70,6 +73,9 @@ export function mapMessageEvent(event, options) {
     ...(event.thread_id ? { MessageThreadId: event.thread_id } : {}),
     ...(event.reply_to ? { ReplyToId: event.reply_to } : {}),
     WasMentioned: mentioned,
+    // Keep precise bot mention separate from the broader group gate, which
+    // also treats @all (and unknown-bot fallback mentions) as a mention.
+    BotWasMentioned: botWasMentioned,
     // routing
     ...(route?.agentId ? { AgentId: route.agentId } : {}),
     ...(route?.sessionKey ? { SessionKey: route.sessionKey } : {}),

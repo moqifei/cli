@@ -55,7 +55,8 @@ import {
   resolveProxyConfig,
 } from "./proxy.mjs";
 import { buildBriefCard } from "./brief-card.mjs";
-import { splitReasoningText } from "./card.mjs";
+import { updateCollaborationApproval } from "./collaboration-cards.mjs";
+import { buildCompleteCard, splitReasoningText } from "./card.mjs";
 import { looksLikeEnvelope, renderDeltaForUser } from "./render.mjs";
 import { prefetchInboundIdentity, registerHttpTokenInjector } from "./http-token-injector.mjs";
 import { createUserTools } from "./user-tools.mjs";
@@ -820,6 +821,7 @@ class AccountRuntime {
           onReplyStart: async () => {
             await stream.ensureStarted();
           },
+          onStreamEnd: () => stream.suppressWarmup(),
           onPartialReply: (payload) => {
             // Never stream a brief that is about to be replaced by the gate,
             // and never stream a half-written JSON envelope.
@@ -1324,6 +1326,73 @@ export function createChannelPlugin({ api, pluginConfig, logger, resolveAccounts
         const account = accounts.find((entry) => entry.accountId === accountId) ?? accounts[0];
         if (!account) throw new Error("orange-lark-cli: no account configured");
         const log = logger.child(account.accountId);
+
+        const collaborationResult = params?.blocks?.orange_collaboration_result;
+        if (collaborationResult && typeof collaborationResult === "object") {
+          const text = String(collaborationResult.text ?? params?.text ?? "").trim();
+          const replyToMessageId = String(collaborationResult.reply_to_message_id ?? "");
+          const taskId = String(collaborationResult.task_id ?? "");
+          if (!text || !replyToMessageId || !taskId) {
+            throw new Error("orange-lark-cli: collaboration result requires text, task id, and source message id");
+          }
+          const thinkingText = String(collaborationResult.thinking_text ?? "").trim();
+          const { messageId } = await sendCard({
+            cliPath: account.cliPath,
+            configDir: account.configDir,
+            cwd: account.scratchDir,
+            identity: account.identity,
+            to: params?.to,
+            card: buildCompleteCard({
+              text,
+              reasoningText: thinkingText,
+              reasoningEnabled: Boolean(thinkingText),
+              reasoningExpanded: false,
+              showToolUse: false,
+            }),
+            replyToMessageId,
+            replyInThread: account.replyInThread,
+            timeoutMs: account.sendTimeoutMs,
+            env: account.env,
+            log,
+          });
+          return { messageId };
+        }
+
+        const collaborationReceipt = params?.blocks?.orange_collaboration_receipt;
+        if (collaborationReceipt && typeof collaborationReceipt === "object") {
+          const text = String(collaborationReceipt.text ?? params?.text ?? "").trim();
+          const replyToMessageId = String(collaborationReceipt.reply_to_message_id ?? "");
+          const eventId = String(collaborationReceipt.event_id ?? "");
+          if (!text || !replyToMessageId || !eventId) {
+            throw new Error("orange-lark-cli: collaboration receipt requires text, source message id, and event id");
+          }
+          const { messageId } = await sendCard({
+            cliPath: account.cliPath,
+            configDir: account.configDir,
+            cwd: account.scratchDir,
+            identity: account.identity,
+            to: params?.to,
+            card: buildCompleteCard({ text, reasoningEnabled: false, showToolUse: false }),
+            replyToMessageId,
+            replyInThread: account.replyInThread,
+            idempotencyKey: `receipt-${eventId}`,
+            timeoutMs: account.sendTimeoutMs,
+            env: account.env,
+            log,
+          });
+          return { messageId };
+        }
+
+        const approvalUpdate = params?.blocks?.orange_collaboration_approval_update;
+        if (approvalUpdate && typeof approvalUpdate === "object") {
+          const approvalId = String(approvalUpdate.approval_id ?? "");
+          const state = String(approvalUpdate.state ?? "");
+          const updated = await updateCollaborationApproval(account, approvalId, state, { log });
+          if (!updated) {
+            throw new Error(`orange-lark-cli: no matching approval card or conflicting terminal state (${approvalId}, ${state})`);
+          }
+          return { messageId: `approval-update-${approvalId}` };
+        }
 
         // 多来源简报：Rust 侧把原始 delta 信封放进 blocks 带过来，用它构造
         // Card 2.0（原生表格）。卡片发不出去就退回渲染好的人话；绝不能让
